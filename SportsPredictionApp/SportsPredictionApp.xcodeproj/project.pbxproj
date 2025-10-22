@@ -1,0 +1,13 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+		// This is a simplified Xcode project file
+		// To properly use this project, open it in Xcode on macOS
+		// and let Xcode regenerate the full project structure
+	};
+	rootObject = "Root Project Object";
+}
