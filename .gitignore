@@ -1,22 +1,68 @@
-*.csv
-*.log
-*.pyc
-*.bak
-*.log.lock
-.DS_Store
-.ftp*
-.vite
-.vimrc
-.vscode/*
+# Python
 __pycache__/
-node_modules/
-data/log/*
-data/charge_log/*
-data/daily_log/*
-data/monthly_log/*
-data/backup/*.tar.gz
-data/restore/*.tar.gz
-data/data_migration/*.tar.gz
-ramdisk/*
-web/lastcommit
-!.gitignore 
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Data
+data/raw/*.csv
+data/processed/*.csv
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Models
+models/*.pkl
+models/*.h5
+models/*.pt
+!models/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# MLflow
+mlruns/
+
+# Coverage
+.coverage
+htmlcov/

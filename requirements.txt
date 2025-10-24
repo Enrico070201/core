@@ -1,25 +1,57 @@
-typing-extensions==4.4.0
-jq==1.1.3
-paho_mqtt==1.6.1
-pymodbus==2.5.2
-pytest==6.2.5
-requests_mock==1.9.3
-lxml==4.9.1
-aiohttp==3.12.14
-schedule==1.1.0
-PyJWT==2.6.0
-bs4==0.0.1
-pkce==1.0.3
-evdev==1.5.0
-cryptography==44.0.1
-msal==1.31.1
-python-dateutil==2.8.2
-umodbus==1.0.4
-pysmb==1.2.9.1
-pytz==2023.3.post1
-grpcio==1.60.1
-protobuf==4.25.8
-bimmer_connected==0.17.3
-ocpp==1.0.0
-websockets==12.0
-pycarwings3==0.7.14
+# Core ML Libraries
+numpy==1.24.3
+pandas==2.0.3
+scikit-learn==1.3.0
+xgboost==2.0.3
+lightgbm==4.1.0
+
+# Deep Learning
+tensorflow==2.13.0
+keras==2.13.1
+torch==2.0.1
+torchvision==0.15.2
+
+# Data Processing
+scipy==1.11.1
+statsmodels==0.14.0
+
+# Visualization
+matplotlib==3.7.2
+seaborn==0.12.2
+plotly==5.16.1
+
+# API & Web
+flask==2.3.3
+flask-cors==4.0.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# Database
+sqlalchemy==2.0.20
+pymongo==4.5.0
+
+# Utilities
+python-dotenv==1.0.0
+pyyaml==6.0.1
+joblib==1.3.2
+tqdm==4.66.1
+
+# Testing
+pytest==7.4.0
+pytest-cov==4.1.0
+
+# Data Collection (Sports APIs)
+sportsreference==0.6.0
+
+# Feature Engineering
+category-encoders==2.6.2
+imbalanced-learn==0.11.0
+
+# Model Optimization
+optuna==3.3.0
+hyperopt==0.2.7
+
+# Logging & Monitoring
+loguru==0.7.0
+mlflow==2.6.0

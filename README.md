@@ -1,52 +1,119 @@
-# openWB
+# Sportwetten Vorhersage KI-Modell
 
-## Lizenz
+Ein Machine Learning System zur Vorhersage von Sportwettenergebnissen mit modernen KI-Techniken.
 
-Die Software steht unter der GPLv3 Lizenz. Weiterhin ist eine kommerzielle Nutzung nur nach Rücksprache und durch schriftlicher Zustimmung der openWB GmbH & Co. KG erlaubt.
+## Überblick
 
-Unterstützung ist gerne gesehen! Sei es in Form von Code oder durch Spenden. Spenden bitte an <spenden@openwb.de>.
+Dieses Projekt nutzt Machine Learning Algorithmen, um Sportwettenergebnisse zu analysieren und vorherzusagen. Das System verarbeitet historische Spieldaten, Teamstatistiken und weitere relevante Features, um präzise Vorhersagen zu treffen.
 
-Anfragen für Supportverträge an <info@openwb.de>. Weitere Infos unter <https://openwb.de>
+## Features
 
-## Haftungsausschluss
+- **Datenverarbeitung**: Automatisierte Sammlung und Aufbereitung von Sportdaten
+- **Feature Engineering**: Intelligente Extraktion relevanter Merkmale aus Rohdaten
+- **ML-Modelle**: Multiple Algorithmen (Random Forest, XGBoost, Neural Networks)
+- **Vorhersage-API**: REST API für einfache Integration
+- **Backtesting**: Evaluierung der Modellperformance auf historischen Daten
+- **Echtzeitanalyse**: Live-Vorhersagen für aktuelle Spiele
 
-Es wird mit Kleinspannung aber auch 230V beim Anschluss der EVSE gearbeitet.
-Dies darf nur geschultes Personal. Die Anleitung ist ohne Gewähr und jegliches Handeln basiert auf eigene Gefahr.
-Eine Fehlkonfiguration der Software kann höchstens ein nicht geladenes Auto bedeuten.
-Falsch zusammengebaute Hardware kann lebensgefährlich sein. Im Zweifel diesen Part von einem Elektriker durchführen lassen.
-Keine Gewährleistung für die Software - use at your own RISK!
+## Projektstruktur
 
-## Wofür?
-
-Steuerung einer EVSE DIN oder anderer Ladepunkte für sofortiges laden, Überwachung der Ladung, PV Überschussladung und Lastmanagement mehrerer Wallboxen.
-
-Unterstützt wird jedes Fahrzeug, das den AC Ladestandard unterstützt.
-
-## Bezug
-
-openWB gibt es unter <https://openwb.de/shop/>.
+```
+.
+├── src/
+│   ├── data/           # Datensammlung und -verarbeitung
+│   ├── features/       # Feature Engineering
+│   ├── models/         # ML-Modelle
+│   └── utils/          # Hilfsfunktionen
+├── data/
+│   ├── raw/           # Rohdaten
+│   └── processed/     # Verarbeitete Daten
+├── models/            # Trainierte Modelle
+├── notebooks/         # Jupyter Notebooks für Analysen
+└── tests/            # Unit Tests
+```
 
 ## Installation
 
-Bei fertig erworbenen openWB ist die Software bereits vorinstalliert.
-
-Software:
-
-- Installiertes Raspberry Pi OS auf einem Raspberry Pi 3b oder besser.
-- Raspberry Pi OS Lite installieren. Aktuell wird in der Version 2.1 nur **Debian 11 "Bullseye"** (derzeit "oldstable") unterstützt.
-<https://downloads.raspberrypi.org/raspios_oldstable_lite_armhf/>
-- alternativ kann auch ein x86_64 System (Hardware oder als VM) mit installiertem **Debian 11 "Bullseye"** als Basis verwendet werden.
-- Eine Installation unter **Debian 12 "Bookworm"** wird noch nicht unterstützt!
-- Bitte beachten das **Debian 11 "Bullseye"** nur mit erheblichem Aufwand mit einem Raspberry Pi 5 kompatibel ist. Wir empfehlen die Nutzung von einem Raspberry Pi 3b.
-
-In der Shell folgendes eingeben:
-
+1. Repository klonen:
 ```bash
-curl -s https://raw.githubusercontent.com/openWB/core/master/openwb-install.sh | sudo bash
+git clone <repository-url>
+cd core
 ```
 
-## Entwicklung
+2. Virtuelle Umgebung erstellen:
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# oder
+venv\Scripts\activate  # Windows
+```
 
-Der Dienst läuft als Benutzer "openwb" und dementsprechend sind auch die Zugriffsrechte gesetzt. Wenn die Installation auch zur Entwicklung genutzt wird,
-müssen zwingend Lese- und Schreibrechte der Dateien geprüft und ggf korrigiert werden. Um das zu vermeiden empfiehlt es sich, ein Kennwort für den
-Benutzer "openwb" zu setzen und auch mit dieser Anmeldung die Dateien zu bearbeiten.
+3. Abhängigkeiten installieren:
+```bash
+pip install -r requirements.txt
+```
+
+## Verwendung
+
+### 1. Daten sammeln
+```bash
+python src/data/collect_data.py
+```
+
+### 2. Modell trainieren
+```bash
+python src/models/train_model.py
+```
+
+### 3. Vorhersagen erstellen
+```bash
+python src/models/predict.py --match "Team A vs Team B"
+```
+
+### 4. API starten
+```bash
+python src/api/app.py
+```
+
+Die API ist dann unter `http://localhost:5000` erreichbar.
+
+## API Endpoints
+
+- `POST /predict` - Erstellt eine Vorhersage für ein Spiel
+- `GET /models` - Listet verfügbare Modelle auf
+- `GET /stats` - Zeigt Modellstatistiken
+
+## Modelle
+
+Das System unterstützt verschiedene ML-Algorithmen:
+
+1. **Random Forest**: Robust und interpretierbar
+2. **XGBoost**: Hohe Genauigkeit durch Gradient Boosting
+3. **Neural Networks**: Deep Learning für komplexe Muster
+4. **Ensemble**: Kombiniert mehrere Modelle für beste Ergebnisse
+
+## Performance
+
+Die Modelle werden anhand folgender Metriken evaluiert:
+- Accuracy (Genauigkeit)
+- Precision (Präzision)
+- Recall (Trefferquote)
+- F1-Score
+- ROI (Return on Investment)
+
+## Hinweise
+
+⚠️ **Wichtiger Haftungsausschluss**:
+Dieses Projekt dient ausschließlich zu Bildungs- und Forschungszwecken. Sportwetten bergen finanzielle Risiken. Die Vorhersagen sind keine Garantie für Gewinne. Wetten Sie verantwortungsvoll und nur mit Geld, das Sie sich leisten können zu verlieren.
+
+## Lizenz
+
+MIT License
+
+## Beitragen
+
+Contributions sind willkommen! Bitte erstellen Sie einen Pull Request oder öffnen Sie ein Issue für Vorschläge und Fehlerberichte.
+
+## Support
+
+Bei Fragen oder Problemen öffnen Sie bitte ein Issue auf GitHub.
