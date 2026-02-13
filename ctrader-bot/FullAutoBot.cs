@@ -165,7 +165,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 1.5; _atrMultiplierTP = 2.0; _trailingAtrMultiplier = 1.0;
                 _baseRiskPercent = 0.5; _maxDrawdownPercent = 5.0;
-                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 20;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
             }
             else if (tfMinuten <= 30)
             {
@@ -174,7 +174,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 1.8; _atrMultiplierTP = 2.5; _trailingAtrMultiplier = 1.2;
                 _baseRiskPercent = 0.75; _maxDrawdownPercent = 6.0;
-                _maxOpenPositions = 3; _signalCooldown = 2; _staleTradeBarCount = 15;
+                _maxOpenPositions = 3; _signalCooldown = 2; _staleTradeBarCount = 25;
             }
             else if (tfMinuten <= 240)
             {
@@ -183,7 +183,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.0; _atrMultiplierTP = 3.0; _trailingAtrMultiplier = 1.5;
                 _baseRiskPercent = 1.0; _maxDrawdownPercent = 8.0;
-                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 10;
+                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 18;
             }
             else
             {
@@ -192,7 +192,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.5; _atrMultiplierTP = 4.0; _trailingAtrMultiplier = 2.0;
                 _baseRiskPercent = 1.5; _maxDrawdownPercent = 10.0;
-                _maxOpenPositions = 4; _signalCooldown = 1; _staleTradeBarCount = 8;
+                _maxOpenPositions = 4; _signalCooldown = 1; _staleTradeBarCount = 14;
             }
         }
 
@@ -429,10 +429,48 @@ namespace cAlgo.Robots
             // 9. Kerzenformationen (erweitert)
             AnalysiereKerzenFormationen(analyse);
 
-            // 10. Markt-Regime
+            // 10. 3-Bar Momentum Konsistenz
+            double close2m = _marktBars.ClosePrices.Last(2);
+            double close3m = _marktBars.ClosePrices.Last(3);
+            analyse.DreiBarsAufwaerts = close > close2m && close2m > close3m;
+            analyse.DreiBarsAbwaerts = close < close2m && close2m < close3m;
+
+            // 11. Close-Position innerhalb der Bar-Range
+            double high1r = _marktBars.HighPrices.Last(1);
+            double low1r = _marktBars.LowPrices.Last(1);
+            double range1r = high1r - low1r;
+            if (range1r > 0)
+            {
+                double closeRelativ = (close - low1r) / range1r;
+                analyse.CloseImOberenDrittel = closeRelativ > 0.7;
+                analyse.CloseImUnterenDrittel = closeRelativ < 0.3;
+            }
+
+            // 12. EMA-Pullback-Bounce: Preis kam zum Medium-EMA und prallt ab
+            double emaMed = _emaMedium.Result.Last(1);
+            double prevLow = _marktBars.LowPrices.Last(2);
+            double prevHigh = _marktBars.HighPrices.Last(2);
+            // Buy: Vorherige Bar berührte/durchstach Medium EMA von oben, aktuelle schließt darüber
+            analyse.EmaPullbackBounceBuy = prevLow <= emaMed * 1.001 && close > emaMed
+                && analyse.EmaSignal == TrendRichtung.Aufwaerts;
+            // Sell: Vorherige Bar berührte Medium EMA von unten, aktuelle schließt darunter
+            analyse.EmaPullbackBounceSell = prevHigh >= emaMed * 0.999 && close < emaMed
+                && analyse.EmaSignal == TrendRichtung.Abwaerts;
+
+            // 13. ATR expandiert (Markt bewegt sich, Ausbruch)
+            double atrVorher3 = _atr.Result.Last(3);
+            analyse.AtrExpandiert = atrVorher3 > 0 && analyse.AtrWert > atrVorher3 * 1.1;
+
+            // 14. Volle Konfluenz: HTF + EMA + 200 EMA alle in gleicher Richtung
+            analyse.VolleKonfluenzBuy = analyse.HtfTrend == TrendRichtung.Aufwaerts
+                && analyse.EmaSignal == TrendRichtung.Aufwaerts && analyse.UeberEma200;
+            analyse.VolleKonfluenzSell = analyse.HtfTrend == TrendRichtung.Abwaerts
+                && analyse.EmaSignal == TrendRichtung.Abwaerts && !analyse.UeberEma200;
+
+            // 15. Markt-Regime
             analyse.Regime = _aktuellesRegime;
 
-            // 11. Gesamtsignal berechnen
+            // 16. Gesamtsignal berechnen
             BerechneGesamtSignal(analyse);
 
             return analyse;
@@ -624,6 +662,21 @@ namespace cAlgo.Robots
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Aufwaerts)
                 buyScore += 1;
 
+            // 3-Bar Momentum Konsistenz (Gewicht: 1)
+            if (analyse.DreiBarsAufwaerts) buyScore += 1;
+
+            // Close im oberen Drittel der Bar = bullische Überzeugung (Gewicht: 1)
+            if (analyse.CloseImOberenDrittel) buyScore += 1;
+
+            // EMA-Pullback-Bounce = qualitativ hochwertiger Einstieg (Gewicht: 2)
+            if (analyse.EmaPullbackBounceBuy) buyScore += 2;
+
+            // ATR expandiert = Markt bestätigt Bewegung (Gewicht: 1)
+            if (analyse.AtrExpandiert) buyScore += 1;
+
+            // Volle Konfluenz = alle Zeitebenen einig (Gewicht: 1)
+            if (analyse.VolleKonfluenzBuy) buyScore += 1;
+
             // --- GEWICHTETES SELL SCORING ---
 
             if (analyse.HtfTrend == TrendRichtung.Abwaerts) sellScore += 3;
@@ -655,6 +708,21 @@ namespace cAlgo.Robots
 
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Abwaerts)
                 sellScore += 1;
+
+            // 3-Bar Momentum Konsistenz
+            if (analyse.DreiBarsAbwaerts) sellScore += 1;
+
+            // Close im unteren Drittel der Bar = bärische Überzeugung
+            if (analyse.CloseImUnterenDrittel) sellScore += 1;
+
+            // EMA-Pullback-Bounce = qualitativ hochwertiger Einstieg
+            if (analyse.EmaPullbackBounceSell) sellScore += 2;
+
+            // ATR expandiert = Markt bestätigt Bewegung
+            if (analyse.AtrExpandiert) sellScore += 1;
+
+            // Volle Konfluenz = alle Zeitebenen einig
+            if (analyse.VolleKonfluenzSell) sellScore += 1;
 
             // --- ENTSCHEIDUNG ---
             // In Konsolidierung strengeren Schwellenwert verwenden
@@ -831,33 +899,33 @@ namespace cAlgo.Robots
                 double atrPips = AtrZuPips(atr);
                 double slPips = AtrZuPips(atr * _atrMultiplierSL);
 
-                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1R Gewinn
-                if (position.Pips > slPips && !IstBreakEven(position))
+                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1.5R Gewinn
+                if (position.Pips > slPips * 1.5 && !IstBreakEven(position))
                 {
                     SetzeBreakEven(position);
                 }
 
-                // 2. PARTIAL CLOSE bei 2R Gewinn: 50% Position schließen
-                if (position.Pips > slPips * 2.0 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2)
+                // 2. PARTIAL CLOSE bei 3R Gewinn: 50% Position schließen
+                if (position.Pips > slPips * 3.0 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2)
                 {
                     double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
                         position.VolumeInUnits * 0.5, RoundingMode.Down);
                     if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
                     {
                         ClosePosition(position, closeVolume);
-                        Print("PARTIAL CLOSE 50% bei +{0:F1} Pips (2R erreicht)", position.Pips);
+                        Print("PARTIAL CLOSE 50% bei +{0:F1} Pips (3R erreicht)", position.Pips);
                     }
                 }
 
-                // 3. TRAILING STOP (nur bei Gewinn > 1.5R)
-                double trailingStart = slPips * 1.5;
+                // 3. TRAILING STOP (nur bei Gewinn > 2.5R)
+                double trailingStart = slPips * 2.5;
                 if (position.Pips > trailingStart)
                 {
                     double trailingDistanz = AtrZuPips(atr * _trailingAtrMultiplier);
 
                     // Im starken Trend: weiterer Trailing Stop
                     if (_aktuellesRegime == MarktRegime.StarkerTrend)
-                        trailingDistanz *= 1.3;
+                        trailingDistanz *= 1.5;
 
                     double neuerSL;
                     if (position.TradeType == TradeType.Buy)
@@ -916,25 +984,27 @@ namespace cAlgo.Robots
                 // Wie viele Bars ist die Position schon offen?
                 int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
 
-                // STALE TRADE: Position geht nirgendwohin
-                if (barsOffen >= _staleTradeBarCount && Math.Abs(position.Pips) < AtrZuPips(_atr.Result.Last(1) * 0.3))
+                // STALE TRADE: Position geht wirklich nirgendwohin (sehr flach)
+                if (barsOffen >= _staleTradeBarCount && Math.Abs(position.Pips) < AtrZuPips(_atr.Result.Last(1) * 0.15))
                 {
                     Print("STALE TRADE geschlossen nach {0} Bars bei {1:F1} Pips", barsOffen, position.Pips);
                     ClosePosition(position);
                     continue;
                 }
 
-                // REVERSAL-EXIT: Gegenläufiges Signal erkannt
-                bool sollSchliessen = false;
-
-                // RSI extrem gegen Position
+                // REVERSAL-EXIT: Nur bei starken Umkehrsignalen + genug Gewinn
+                // Zähle wie viele Reversal-Indikatoren gleichzeitig feuern
+                int reversalZaehler = 0;
+                double atrPipsReversal = AtrZuPips(_atr.Result.Last(1));
                 double rsi = _rsi.Result.Last(1);
-                if (position.TradeType == TradeType.Buy && rsi > 80)
-                    sollSchliessen = true;
-                if (position.TradeType == TradeType.Sell && rsi < 20)
-                    sollSchliessen = true;
 
-                // EMA-Kreuzung gegen Position
+                // RSI extrem gegen Position (nur bei wirklich extremen Werten)
+                if (position.TradeType == TradeType.Buy && rsi > 85)
+                    reversalZaehler++;
+                if (position.TradeType == TradeType.Sell && rsi < 15)
+                    reversalZaehler++;
+
+                // EMA-Kreuzung gegen Position (nur mit Mindestgewinn von 1.5R)
                 double fast = _emaFast.Result.Last(1);
                 double medium = _emaMedium.Result.Last(1);
                 double fastVorher = _emaFast.Result.Last(2);
@@ -943,26 +1013,28 @@ namespace cAlgo.Robots
                 bool emaBearishCross = fastVorher >= mediumVorher && fast < medium;
                 bool emaBullishCross = fastVorher <= mediumVorher && fast > medium;
 
-                if (position.TradeType == TradeType.Buy && emaBearishCross && position.Pips > 0)
-                    sollSchliessen = true;
-                if (position.TradeType == TradeType.Sell && emaBullishCross && position.Pips > 0)
-                    sollSchliessen = true;
+                if (position.TradeType == TradeType.Buy && emaBearishCross && position.Pips > atrPipsReversal * 1.5)
+                    reversalZaehler++;
+                if (position.TradeType == TradeType.Sell && emaBullishCross && position.Pips > atrPipsReversal * 1.5)
+                    reversalZaehler++;
 
-                // MACD Umkehr gegen Position + Position schon im Gewinn
+                // MACD Umkehr gegen Position (nur mit deutlichem Gewinn von 2R)
                 if (position.TradeType == TradeType.Buy && _macd.Histogram.Last(1) < 0
-                    && _macd.Histogram.Last(2) > 0 && position.Pips > AtrZuPips(_atr.Result.Last(1)))
+                    && _macd.Histogram.Last(2) > 0 && position.Pips > atrPipsReversal * 2.0)
                 {
-                    sollSchliessen = true;
+                    reversalZaehler++;
                 }
                 if (position.TradeType == TradeType.Sell && _macd.Histogram.Last(1) > 0
-                    && _macd.Histogram.Last(2) < 0 && position.Pips > AtrZuPips(_atr.Result.Last(1)))
+                    && _macd.Histogram.Last(2) < 0 && position.Pips > atrPipsReversal * 2.0)
                 {
-                    sollSchliessen = true;
+                    reversalZaehler++;
                 }
 
-                if (sollSchliessen)
+                // Nur schließen wenn mindestens 2 Reversal-Indikatoren gleichzeitig feuern
+                if (reversalZaehler >= 2)
                 {
-                    Print("REVERSAL-EXIT bei {0:F1} Pips (RSI:{1:F0})", position.Pips, rsi);
+                    Print("REVERSAL-EXIT ({0} Signale) bei {1:F1} Pips (RSI:{2:F0})",
+                        reversalZaehler, position.Pips, rsi);
                     ClosePosition(position);
                 }
             }
@@ -1160,6 +1232,17 @@ namespace cAlgo.Robots
             public bool BullishPinBar { get; set; }
             public bool BearishPinBar { get; set; }
             public bool StarkeMomentumKerze { get; set; }
+
+            // Momentum & Konfluenz
+            public bool DreiBarsAufwaerts { get; set; }
+            public bool DreiBarsAbwaerts { get; set; }
+            public bool CloseImOberenDrittel { get; set; }
+            public bool CloseImUnterenDrittel { get; set; }
+            public bool EmaPullbackBounceBuy { get; set; }
+            public bool EmaPullbackBounceSell { get; set; }
+            public bool AtrExpandiert { get; set; }
+            public bool VolleKonfluenzBuy { get; set; }
+            public bool VolleKonfluenzSell { get; set; }
 
             // Regime + Signal
             public MarktRegime Regime { get; set; }
