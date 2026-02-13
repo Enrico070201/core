@@ -28,7 +28,7 @@ namespace cAlgo.Robots
         // NUR DIESE 2 PARAMETER - ALLES ANDERE IST AUTOMATISCH
         // =====================================================================
 
-        [Parameter("Timeframe", DefaultValue = "Hour1")]
+        [Parameter("Timeframe", DefaultValue = "Hour")]
         public TimeFrame BotTimeframe { get; set; }
 
         [Parameter("Markt (Symbol)", DefaultValue = "EURUSD")]
@@ -250,7 +250,7 @@ namespace cAlgo.Robots
         {
             int minuten = TimeframeZuMinuten(tf);
 
-            if (minuten <= 5) return TimeFrame.Hour1;
+            if (minuten <= 5) return TimeFrame.Hour;
             if (minuten <= 15) return TimeFrame.Hour4;
             if (minuten <= 60) return TimeFrame.Daily;
             if (minuten <= 240) return TimeFrame.Weekly;
@@ -588,7 +588,7 @@ namespace cAlgo.Robots
                         neuerSL = _marktSymbol.Bid - (trailingDistanzPips * _marktSymbol.PipSize);
                         if (position.StopLoss == null || neuerSL > position.StopLoss)
                         {
-                            ModifyPosition(position, neuerSL, position.TakeProfit);
+                            position.ModifyStopLossPrice(neuerSL);
                         }
                     }
                     else
@@ -596,7 +596,7 @@ namespace cAlgo.Robots
                         neuerSL = _marktSymbol.Ask + (trailingDistanzPips * _marktSymbol.PipSize);
                         if (position.StopLoss == null || neuerSL < position.StopLoss)
                         {
-                            ModifyPosition(position, neuerSL, position.TakeProfit);
+                            position.ModifyStopLossPrice(neuerSL);
                         }
                     }
                 }
