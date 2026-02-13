@@ -1,19 +1,21 @@
 // ============================================================================
-// FullAutoBot - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v2 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
-// Alles andere wird automatisch berechnet und angepasst:
-//   - Trend-Erkennung (Multi-EMA + ADX)
-//   - Einstiegssignale (RSI + MACD + Bollinger Bands)
-//   - Positionsgröße (ATR-basiertes Risikomanagement)
-//   - Stop-Loss & Take-Profit (dynamisch via ATR)
-//   - Trailing Stop (automatische Gewinnabsicherung)
-//   - Volatilitätsfilter (handelt nicht bei zu niedriger/hoher Vola)
-//   - Session-Filter (handelt nur in aktiven Marktzeiten)
-//   - Max Drawdown Schutz
+// Alles andere wird automatisch berechnet und angepasst.
+//
+// v2 Verbesserungen:
+//   - Ereignisreaktion: Position-Close-Events, Spread-Spike-Erkennung,
+//     Gap-Detection, Reversal-Exit, Stale-Trade-Timeout
+//   - Positionsgrößen: Kelly-Criterion, Win-Rate-Tracking,
+//     Pyramiding bei starken Trends, Anti-Martingale
+//   - Profitabilität: Partial-Close bei 1R/2R, Break-Even-Stop,
+//     dynamische TP-Extension, Markt-Regime-Erkennung,
+//     aktiver Reversal-Exit, Spread-Filter
 // ============================================================================
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Indicators;
@@ -35,37 +37,48 @@ namespace cAlgo.Robots
         public string MarktSymbol { get; set; }
 
         // =====================================================================
-        // AUTOMATISCH BERECHNETE INTERNE VARIABLEN
+        // INDIKATOREN
         // =====================================================================
 
-        // Indikatoren
         private ExponentialMovingAverage _emaFast;
         private ExponentialMovingAverage _emaMedium;
         private ExponentialMovingAverage _emaSlow;
+        private ExponentialMovingAverage _ema200;
         private RelativeStrengthIndex _rsi;
         private MacdCrossOver _macd;
         private BollingerBands _bollingerBands;
         private AverageTrueRange _atr;
         private DirectionalMovementSystem _adx;
 
-        // Higher Timeframe Trend
+        // Higher Timeframe
         private Bars _higherTimeframeBars;
         private ExponentialMovingAverage _htfEmaFast;
         private ExponentialMovingAverage _htfEmaSlow;
+        private AverageTrueRange _htfAtr;
 
         // Markt-Referenz
         private Symbol _marktSymbol;
         private Bars _marktBars;
 
-        // Risikomanagement
-        private double _riskPercent;
-        private double _maxDrawdownPercent;
-        private double _initialBalance;
-        private int _maxOpenPositions;
+        // =====================================================================
+        // PERFORMANCE-TRACKING (für Kelly-Criterion & adaptive Größen)
+        // =====================================================================
+
+        private readonly List<double> _tradeResultsPips = new List<double>();
+        private int _totalWins;
+        private int _totalLosses;
+        private double _summeGewinne;
+        private double _summeVerluste;
+        private int _consecutiveWins;
         private int _consecutiveLosses;
+        private double _peakBalance;
+        private double _initialBalance;
         private double _currentDrawdown;
 
-        // Adaptive Parameter
+        // =====================================================================
+        // ADAPTIVE PARAMETER
+        // =====================================================================
+
         private int _emaFastPeriod;
         private int _emaMediumPeriod;
         private int _emaSlowPeriod;
@@ -77,10 +90,19 @@ namespace cAlgo.Robots
         private double _atrMultiplierSL;
         private double _atrMultiplierTP;
         private double _trailingAtrMultiplier;
+        private double _baseRiskPercent;
+        private double _maxDrawdownPercent;
+        private int _maxOpenPositions;
+        private int _signalCooldown;
+        private int _staleTradeBarCount;
 
         // Signal-Tracking
-        private int _signalCooldown;
         private DateTime _lastTradeTime;
+        private double _lastSpread;
+        private double _avgSpread;
+        private int _spreadSampleCount;
+        private MarktRegime _aktuellesRegime;
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -89,10 +111,9 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot wird gestartet ===");
+            Print("=== FullAutoBot v2 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
-            // Symbol laden
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
             if (_marktSymbol == null)
             {
@@ -101,31 +122,32 @@ namespace cAlgo.Robots
                 return;
             }
 
-            // Bars für den gewählten Timeframe laden
             _marktBars = MarketData.GetBars(BotTimeframe, _marktSymbol.Name);
 
-            // Parameter automatisch an Timeframe anpassen
             AdaptiereParameterAnTimeframe();
-
-            // Indikatoren initialisieren
             InitialisiereIndikatoren();
-
-            // Higher Timeframe für Trendbestätigung
             InitialisiereHigherTimeframe();
 
-            // Risikomanagement initialisieren
+            // Performance-Tracking initialisieren
             _initialBalance = Account.Balance;
+            _peakBalance = Account.Balance;
             _consecutiveLosses = 0;
-            _currentDrawdown = 0;
+            _consecutiveWins = 0;
+            _totalWins = 0;
+            _totalLosses = 0;
+            _summeGewinne = 0;
+            _summeVerluste = 0;
             _lastTradeTime = DateTime.MinValue;
+            _avgSpread = _marktSymbol.Spread;
+            _spreadSampleCount = 1;
+            _aktuellesRegime = MarktRegime.Unbekannt;
 
-            // Auf neue Bars reagieren
+            // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
+            Positions.Closed += OnPositionClosed;
 
-            Print("Bot erfolgreich initialisiert.");
-            Print("Risiko pro Trade: {0:F1}% | Max Drawdown: {1:F1}%", _riskPercent, _maxDrawdownPercent);
-            Print("EMA: {0}/{1}/{2} | RSI: {3} | ATR: {4}", _emaFastPeriod, _emaMediumPeriod, _emaSlowPeriod, _rsiPeriod, _atrPeriod);
-            Print("SL-Multiplikator: {0:F1}x ATR | TP-Multiplikator: {1:F1}x ATR", _atrMultiplierSL, _atrMultiplierTP);
+            Print("Bot initialisiert | Basis-Risiko: {0:F2}% | Max Drawdown: {1:F1}%",
+                _baseRiskPercent, _maxDrawdownPercent);
         }
 
         // =====================================================================
@@ -134,84 +156,43 @@ namespace cAlgo.Robots
 
         private void AdaptiereParameterAnTimeframe()
         {
-            // Timeframe in Minuten umrechnen für adaptive Berechnung
             int tfMinuten = TimeframeZuMinuten(BotTimeframe);
 
             if (tfMinuten <= 5)
             {
-                // M1 - M5: Scalping-Modus
-                _emaFastPeriod = 8;
-                _emaMediumPeriod = 21;
-                _emaSlowPeriod = 55;
-                _rsiPeriod = 10;
-                _atrPeriod = 14;
-                _adxPeriod = 14;
-                _bollingerPeriod = 20;
-                _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 1.5;
-                _atrMultiplierTP = 2.0;
-                _trailingAtrMultiplier = 1.0;
-                _riskPercent = 0.5;
-                _maxDrawdownPercent = 5.0;
-                _maxOpenPositions = 2;
-                _signalCooldown = 3;
+                _emaFastPeriod = 8; _emaMediumPeriod = 21; _emaSlowPeriod = 55;
+                _rsiPeriod = 10; _atrPeriod = 14; _adxPeriod = 14;
+                _bollingerPeriod = 20; _bollingerStdDev = 2.0;
+                _atrMultiplierSL = 1.5; _atrMultiplierTP = 2.0; _trailingAtrMultiplier = 1.0;
+                _baseRiskPercent = 0.5; _maxDrawdownPercent = 5.0;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 20;
             }
             else if (tfMinuten <= 30)
             {
-                // M15 - M30: Intraday-Modus
-                _emaFastPeriod = 10;
-                _emaMediumPeriod = 25;
-                _emaSlowPeriod = 50;
-                _rsiPeriod = 14;
-                _atrPeriod = 14;
-                _adxPeriod = 14;
-                _bollingerPeriod = 20;
-                _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 1.8;
-                _atrMultiplierTP = 2.5;
-                _trailingAtrMultiplier = 1.2;
-                _riskPercent = 0.75;
-                _maxDrawdownPercent = 6.0;
-                _maxOpenPositions = 3;
-                _signalCooldown = 2;
+                _emaFastPeriod = 10; _emaMediumPeriod = 25; _emaSlowPeriod = 50;
+                _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
+                _bollingerPeriod = 20; _bollingerStdDev = 2.0;
+                _atrMultiplierSL = 1.8; _atrMultiplierTP = 2.5; _trailingAtrMultiplier = 1.2;
+                _baseRiskPercent = 0.75; _maxDrawdownPercent = 6.0;
+                _maxOpenPositions = 3; _signalCooldown = 2; _staleTradeBarCount = 15;
             }
             else if (tfMinuten <= 240)
             {
-                // H1 - H4: Swing-Modus
-                _emaFastPeriod = 12;
-                _emaMediumPeriod = 26;
-                _emaSlowPeriod = 50;
-                _rsiPeriod = 14;
-                _atrPeriod = 14;
-                _adxPeriod = 14;
-                _bollingerPeriod = 20;
-                _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 2.0;
-                _atrMultiplierTP = 3.0;
-                _trailingAtrMultiplier = 1.5;
-                _riskPercent = 1.0;
-                _maxDrawdownPercent = 8.0;
-                _maxOpenPositions = 3;
-                _signalCooldown = 1;
+                _emaFastPeriod = 12; _emaMediumPeriod = 26; _emaSlowPeriod = 50;
+                _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
+                _bollingerPeriod = 20; _bollingerStdDev = 2.0;
+                _atrMultiplierSL = 2.0; _atrMultiplierTP = 3.0; _trailingAtrMultiplier = 1.5;
+                _baseRiskPercent = 1.0; _maxDrawdownPercent = 8.0;
+                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 10;
             }
             else
             {
-                // Daily+: Positions-Modus
-                _emaFastPeriod = 10;
-                _emaMediumPeriod = 21;
-                _emaSlowPeriod = 50;
-                _rsiPeriod = 14;
-                _atrPeriod = 20;
-                _adxPeriod = 14;
-                _bollingerPeriod = 20;
-                _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 2.5;
-                _atrMultiplierTP = 4.0;
-                _trailingAtrMultiplier = 2.0;
-                _riskPercent = 1.5;
-                _maxDrawdownPercent = 10.0;
-                _maxOpenPositions = 4;
-                _signalCooldown = 1;
+                _emaFastPeriod = 10; _emaMediumPeriod = 21; _emaSlowPeriod = 50;
+                _rsiPeriod = 14; _atrPeriod = 20; _adxPeriod = 14;
+                _bollingerPeriod = 20; _bollingerStdDev = 2.0;
+                _atrMultiplierSL = 2.5; _atrMultiplierTP = 4.0; _trailingAtrMultiplier = 2.0;
+                _baseRiskPercent = 1.5; _maxDrawdownPercent = 10.0;
+                _maxOpenPositions = 4; _signalCooldown = 1; _staleTradeBarCount = 8;
             }
         }
 
@@ -221,21 +202,17 @@ namespace cAlgo.Robots
 
         private void InitialisiereIndikatoren()
         {
-            var closeSeries = _marktBars.ClosePrices;
-
-            _emaFast = Indicators.ExponentialMovingAverage(closeSeries, _emaFastPeriod);
-            _emaMedium = Indicators.ExponentialMovingAverage(closeSeries, _emaMediumPeriod);
-            _emaSlow = Indicators.ExponentialMovingAverage(closeSeries, _emaSlowPeriod);
-            _rsi = Indicators.RelativeStrengthIndex(closeSeries, _rsiPeriod);
-            _macd = Indicators.MacdCrossOver(closeSeries, 12, 26, 9);
-            _bollingerBands = Indicators.BollingerBands(closeSeries, _bollingerPeriod, _bollingerStdDev, MovingAverageType.Exponential);
+            var close = _marktBars.ClosePrices;
+            _emaFast = Indicators.ExponentialMovingAverage(close, _emaFastPeriod);
+            _emaMedium = Indicators.ExponentialMovingAverage(close, _emaMediumPeriod);
+            _emaSlow = Indicators.ExponentialMovingAverage(close, _emaSlowPeriod);
+            _ema200 = Indicators.ExponentialMovingAverage(close, 200);
+            _rsi = Indicators.RelativeStrengthIndex(close, _rsiPeriod);
+            _macd = Indicators.MacdCrossOver(close, 12, 26, 9);
+            _bollingerBands = Indicators.BollingerBands(close, _bollingerPeriod, _bollingerStdDev, MovingAverageType.Exponential);
             _atr = Indicators.AverageTrueRange(_marktBars, _atrPeriod, MovingAverageType.Exponential);
             _adx = Indicators.DirectionalMovementSystem(_marktBars, _adxPeriod);
         }
-
-        // =====================================================================
-        // HIGHER TIMEFRAME TREND
-        // =====================================================================
 
         private void InitialisiereHigherTimeframe()
         {
@@ -243,13 +220,13 @@ namespace cAlgo.Robots
             _higherTimeframeBars = MarketData.GetBars(htf, _marktSymbol.Name);
             _htfEmaFast = Indicators.ExponentialMovingAverage(_higherTimeframeBars.ClosePrices, 12);
             _htfEmaSlow = Indicators.ExponentialMovingAverage(_higherTimeframeBars.ClosePrices, 26);
-            Print("Higher Timeframe für Trend: {0}", htf);
+            _htfAtr = Indicators.AverageTrueRange(_higherTimeframeBars, 14, MovingAverageType.Exponential);
+            Print("Higher Timeframe: {0}", htf);
         }
 
         private TimeFrame ErmittleHigherTimeframe(TimeFrame tf)
         {
             int minuten = TimeframeZuMinuten(tf);
-
             if (minuten <= 5) return TimeFrame.Hour;
             if (minuten <= 15) return TimeFrame.Hour4;
             if (minuten <= 60) return TimeFrame.Daily;
@@ -258,31 +235,136 @@ namespace cAlgo.Robots
         }
 
         // =====================================================================
+        // EVENT: POSITION GESCHLOSSEN - Performance-Tracking
+        // =====================================================================
+
+        private void OnPositionClosed(PositionClosedEventArgs args)
+        {
+            var pos = args.Position;
+            if (pos.Label != BotLabel || pos.SymbolName != _marktSymbol.Name)
+                return;
+
+            double pips = pos.Pips;
+            _tradeResultsPips.Add(pips);
+
+            if (pips > 0)
+            {
+                _totalWins++;
+                _summeGewinne += pips;
+                _consecutiveWins++;
+                _consecutiveLosses = 0;
+                Print("WIN +{0:F1} Pips | Streak: {1}W | WR: {2:F1}%",
+                    pips, _consecutiveWins, WinRate() * 100);
+            }
+            else
+            {
+                _totalLosses++;
+                _summeVerluste += Math.Abs(pips);
+                _consecutiveLosses++;
+                _consecutiveWins = 0;
+                Print("LOSS {0:F1} Pips | Streak: {1}L | WR: {2:F1}%",
+                    pips, _consecutiveLosses, WinRate() * 100);
+            }
+
+            // Peak-Balance aktualisieren
+            if (Account.Balance > _peakBalance)
+                _peakBalance = Account.Balance;
+        }
+
+        // =====================================================================
         // HAUPTLOGIK - BEI JEDER NEUEN BAR
         // =====================================================================
 
         private void OnBarOpened(BarOpenedEventArgs args)
         {
+            // Spread-Tracking aktualisieren
+            AktualisiereSpreadTracking();
+
             // Sicherheitschecks
             if (!DarfHandeln())
                 return;
 
-            // Bestehende Positionen verwalten (Trailing Stop)
+            // Markt-Regime erkennen
+            _aktuellesRegime = ErkenneMarktRegime();
+
+            // Bestehende Positionen aktiv verwalten
             VerwalteBestehendePositionen();
 
+            // Stale Trades prüfen und schließen
+            PruefeStaleTradesUndReversals();
+
             // Aktuelle Werte auslesen
-            int index = _marktBars.ClosePrices.Count - 2; // Letzte abgeschlossene Bar
-            if (index < _emaSlowPeriod + 10)
+            int index = _marktBars.ClosePrices.Count - 2;
+            if (index < 210) // 200 EMA + Puffer
                 return;
+
+            // Gap-Detection: Warnung bei großen Gaps
+            if (ErkenneGap())
+            {
+                Print("GAP erkannt - überspringe diese Bar");
+                return;
+            }
+
+            // Spread-Spike-Filter
+            if (IstSpreadZuHoch())
+            {
+                Print("Spread-Spike erkannt ({0:F1} vs Avg {1:F1}) - kein neuer Trade",
+                    _marktSymbol.Spread, _avgSpread);
+                return;
+            }
 
             // Marktanalyse durchführen
             var analyse = AnalysiereMarkt(index);
 
-            // Handelssignale prüfen und ausführen
+            // Pyramiding: Prüfe ob bestehende Position verstärkt werden kann
             if (analyse.Signal != SignalTyp.Kein)
             {
-                FuehreTradeAus(analyse);
+                var offene = Positions.FindAll(BotLabel, _marktSymbol.Name);
+                bool bereitsInRichtung = offene.Any(p =>
+                    (analyse.Signal == SignalTyp.Buy && p.TradeType == TradeType.Buy) ||
+                    (analyse.Signal == SignalTyp.Sell && p.TradeType == TradeType.Sell));
+
+                if (bereitsInRichtung && offene.Length < _maxOpenPositions)
+                {
+                    // Pyramiding nur wenn bestehende Position bereits im Gewinn
+                    var bestehende = offene.First(p =>
+                        (analyse.Signal == SignalTyp.Buy && p.TradeType == TradeType.Buy) ||
+                        (analyse.Signal == SignalTyp.Sell && p.TradeType == TradeType.Sell));
+
+                    if (bestehende.Pips > AtrZuPips(_atr.Result.Last(1) * 1.0) && analyse.SignalScore >= 7)
+                    {
+                        Print("PYRAMIDING: Bestehende Pos +{0:F1} Pips, Score {1} - verstärke",
+                            bestehende.Pips, analyse.SignalScore);
+                        FuehreTradeAus(analyse, true);
+                    }
+                }
+                else if (!bereitsInRichtung)
+                {
+                    FuehreTradeAus(analyse, false);
+                }
             }
+        }
+
+        // =====================================================================
+        // MARKT-REGIME-ERKENNUNG
+        // =====================================================================
+
+        private MarktRegime ErkenneMarktRegime()
+        {
+            double adx = _adx.ADX.Last(1);
+            double bbBreite = 0;
+            double bbMain = _bollingerBands.Main.Last(1);
+            if (bbMain > 0)
+                bbBreite = (_bollingerBands.Top.Last(1) - _bollingerBands.Bottom.Last(1)) / bbMain;
+
+            // ADX-basierte Regime-Erkennung
+            if (adx > 30 && bbBreite > 0.02)
+                return MarktRegime.StarkerTrend;
+            if (adx > 20)
+                return MarktRegime.MittlererTrend;
+            if (adx < 15 && bbBreite < 0.01)
+                return MarktRegime.Konsolidierung;
+            return MarktRegime.SchwacherTrend;
         }
 
         // =====================================================================
@@ -293,55 +375,163 @@ namespace cAlgo.Robots
         {
             var analyse = new MarktAnalyse();
 
-            // 1. Higher Timeframe Trend bestimmen
+            // 1. Higher Timeframe Trend
             analyse.HtfTrend = ErmittleHTFTrend();
 
-            // 2. Aktueller Trend via EMAs
+            // 2. EMA Trend
             analyse.EmaSignal = ErmittleEmaTrend(index);
 
-            // 3. Trendstärke via ADX
+            // 3. 200 EMA Langfristtrend
+            double close = _marktBars.ClosePrices.Last(1);
+            analyse.UeberEma200 = close > _ema200.Result.Last(1);
+
+            // 4. ADX Trendstärke + DI-Richtung
             analyse.Trendstaerke = _adx.ADX.Last(1);
             analyse.IstTrendStark = analyse.Trendstaerke > 20;
+            analyse.DiPlus = _adx.DIPlus.Last(1);
+            analyse.DiMinus = _adx.DIMinus.Last(1);
 
-            // 4. RSI-Analyse
+            // 5. RSI mit Divergenz-Erkennung
             analyse.RsiWert = _rsi.Result.Last(1);
+            analyse.RsiVorher = _rsi.Result.Last(2);
             analyse.RsiUeberkauft = analyse.RsiWert > 70;
             analyse.RsiUeberverkauft = analyse.RsiWert < 30;
-            analyse.RsiNeutral = analyse.RsiWert > 40 && analyse.RsiWert < 60;
+            analyse.RsiBullishDivergenz = ErkenneRsiBullishDivergenz();
+            analyse.RsiBearishDivergenz = ErkenneRsiBearishDivergenz();
 
-            // 5. MACD-Analyse
+            // 6. MACD mit Momentum-Stärke
             analyse.MacdHistogramm = _macd.Histogram.Last(1);
             analyse.MacdHistogrammVorher = _macd.Histogram.Last(2);
+            analyse.MacdHistogrammVorVorher = _macd.Histogram.Last(3);
             analyse.MacdBullishCross = analyse.MacdHistogramm > 0 && analyse.MacdHistogrammVorher <= 0;
             analyse.MacdBearishCross = analyse.MacdHistogramm < 0 && analyse.MacdHistogrammVorher >= 0;
+            // Momentum nimmt zu?
+            analyse.MacdMomentumSteigt = Math.Abs(analyse.MacdHistogramm) > Math.Abs(analyse.MacdHistogrammVorher)
+                && Math.Abs(analyse.MacdHistogrammVorher) > Math.Abs(analyse.MacdHistogrammVorVorher);
 
-            // 6. Bollinger Bands Analyse
-            double close = _marktBars.ClosePrices.Last(1);
+            // 7. Bollinger Bands
             analyse.PreisNahOberemBand = close >= _bollingerBands.Top.Last(1) * 0.998;
             analyse.PreisNahUnteremBand = close <= _bollingerBands.Bottom.Last(1) * 1.002;
-            analyse.BollingerBreite = (_bollingerBands.Top.Last(1) - _bollingerBands.Bottom.Last(1)) / _bollingerBands.Main.Last(1);
+            double bbMain = _bollingerBands.Main.Last(1);
+            analyse.BollingerBreite = bbMain > 0 ? (_bollingerBands.Top.Last(1) - _bollingerBands.Bottom.Last(1)) / bbMain : 0;
+            // Squeeze: Bollinger wird eng -> Ausbruch erwartet
+            double bbBreiteVorher = 0;
+            double bbMainVorher = _bollingerBands.Main.Last(5);
+            if (bbMainVorher > 0)
+                bbBreiteVorher = (_bollingerBands.Top.Last(5) - _bollingerBands.Bottom.Last(5)) / bbMainVorher;
+            analyse.BollingerSqueeze = analyse.BollingerBreite < bbBreiteVorher * 0.7;
 
-            // 7. Volatilitätsanalyse via ATR
+            // 8. ATR / Volatilität
             analyse.AtrWert = _atr.Result.Last(1);
-            analyse.AtrProzent = (analyse.AtrWert / close) * 100;
-
-            // Volatilitätsfilter: Nicht handeln bei extrem niedriger oder hoher Vola
+            analyse.AtrProzent = close > 0 ? (analyse.AtrWert / close) * 100 : 0;
             analyse.VolatilitaetOk = analyse.AtrProzent > 0.02 && analyse.AtrProzent < 2.0;
 
-            // 8. Kerzenformation der letzten Bar
-            double open = _marktBars.OpenPrices.Last(1);
-            double high = _marktBars.HighPrices.Last(1);
-            double low = _marktBars.LowPrices.Last(1);
-            analyse.IstBullishKerze = close > open;
-            analyse.IstBearishKerze = close < open;
-            analyse.KerzenKoerper = Math.Abs(close - open);
-            analyse.ObererDocht = high - Math.Max(close, open);
-            analyse.UntererDocht = Math.Min(close, open) - low;
+            // 9. Kerzenformationen (erweitert)
+            AnalysiereKerzenFormationen(analyse);
 
-            // 9. Gesamtsignal berechnen
-            analyse.Signal = BerechneGesamtSignal(analyse);
+            // 10. Markt-Regime
+            analyse.Regime = _aktuellesRegime;
+
+            // 11. Gesamtsignal berechnen
+            BerechneGesamtSignal(analyse);
 
             return analyse;
+        }
+
+        // =====================================================================
+        // KERZENFORMATIONEN (ERWEITERT)
+        // =====================================================================
+
+        private void AnalysiereKerzenFormationen(MarktAnalyse analyse)
+        {
+            double close1 = _marktBars.ClosePrices.Last(1);
+            double open1 = _marktBars.OpenPrices.Last(1);
+            double high1 = _marktBars.HighPrices.Last(1);
+            double low1 = _marktBars.LowPrices.Last(1);
+            double close2 = _marktBars.ClosePrices.Last(2);
+            double open2 = _marktBars.OpenPrices.Last(2);
+
+            double koerper = Math.Abs(close1 - open1);
+            double oberDocht = high1 - Math.Max(close1, open1);
+            double unterDocht = Math.Min(close1, open1) - low1;
+            double gesamtRange = high1 - low1;
+
+            analyse.IstBullishKerze = close1 > open1;
+            analyse.IstBearishKerze = close1 < open1;
+            analyse.KerzenKoerper = koerper;
+            analyse.ObererDocht = oberDocht;
+            analyse.UntererDocht = unterDocht;
+
+            // Engulfing Pattern
+            analyse.BullishEngulfing = close1 > open1 && close2 < open2
+                && close1 > open2 && open1 < close2;
+            analyse.BearishEngulfing = close1 < open1 && close2 > open2
+                && close1 < open2 && open1 > close2;
+
+            // Pin Bar / Hammer
+            if (gesamtRange > 0)
+            {
+                analyse.BullishPinBar = unterDocht > koerper * 2.0 && oberDocht < koerper * 0.5
+                    && unterDocht > gesamtRange * 0.6;
+                analyse.BearishPinBar = oberDocht > koerper * 2.0 && unterDocht < koerper * 0.5
+                    && oberDocht > gesamtRange * 0.6;
+            }
+
+            // Starke Momentum-Kerze (großer Körper, kleine Dochte)
+            if (gesamtRange > 0)
+            {
+                analyse.StarkeMomentumKerze = koerper > gesamtRange * 0.75;
+            }
+        }
+
+        // =====================================================================
+        // RSI DIVERGENZ-ERKENNUNG
+        // =====================================================================
+
+        private bool ErkenneRsiBullishDivergenz()
+        {
+            if (_marktBars.LowPrices.Count < 15 || _rsi.Result.Count < 15)
+                return false;
+
+            // Preis macht tieferes Tief, RSI macht höheres Tief
+            double preisLow1 = _marktBars.LowPrices.Last(1);
+            double preisLow5 = _marktBars.LowPrices.Minimum(10);
+            double rsi1 = _rsi.Result.Last(1);
+
+            // Finde RSI am Preistief
+            double rsiAmTief = double.MaxValue;
+            for (int i = 2; i <= 10; i++)
+            {
+                if (_marktBars.LowPrices.Last(i) <= preisLow5 * 1.001)
+                {
+                    rsiAmTief = Math.Min(rsiAmTief, _rsi.Result.Last(i));
+                    break;
+                }
+            }
+
+            return preisLow1 <= preisLow5 * 1.001 && rsi1 > rsiAmTief + 3 && rsi1 < 40;
+        }
+
+        private bool ErkenneRsiBearishDivergenz()
+        {
+            if (_marktBars.HighPrices.Count < 15 || _rsi.Result.Count < 15)
+                return false;
+
+            double preisHigh1 = _marktBars.HighPrices.Last(1);
+            double preisHigh5 = _marktBars.HighPrices.Maximum(10);
+            double rsi1 = _rsi.Result.Last(1);
+
+            double rsiAmHoch = double.MinValue;
+            for (int i = 2; i <= 10; i++)
+            {
+                if (_marktBars.HighPrices.Last(i) >= preisHigh5 * 0.999)
+                {
+                    rsiAmHoch = Math.Max(rsiAmHoch, _rsi.Result.Last(i));
+                    break;
+                }
+            }
+
+            return preisHigh1 >= preisHigh5 * 0.999 && rsi1 < rsiAmHoch - 3 && rsi1 > 60;
         }
 
         // =====================================================================
@@ -370,237 +560,445 @@ namespace cAlgo.Robots
             double medium = _emaMedium.Result.Last(1);
             double slow = _emaSlow.Result.Last(1);
 
-            // Klarer Aufwärtstrend: Fast > Medium > Slow
             if (fast > medium && medium > slow)
                 return TrendRichtung.Aufwaerts;
-
-            // Klarer Abwärtstrend: Fast < Medium < Slow
             if (fast < medium && medium < slow)
                 return TrendRichtung.Abwaerts;
-
             return TrendRichtung.Seitwaerts;
         }
 
         // =====================================================================
-        // SIGNAL-BERECHNUNG (SCORING SYSTEM)
+        // SIGNAL-BERECHNUNG (VERBESSERTES SCORING)
         // =====================================================================
 
-        private SignalTyp BerechneGesamtSignal(MarktAnalyse analyse)
+        private void BerechneGesamtSignal(MarktAnalyse analyse)
         {
-            // Volatilitätsfilter
+            analyse.Signal = SignalTyp.Kein;
+            analyse.SignalScore = 0;
+
             if (!analyse.VolatilitaetOk)
-                return SignalTyp.Kein;
+                return;
 
             int buyScore = 0;
             int sellScore = 0;
 
-            // --- BUY SCORING ---
+            // --- GEWICHTETES BUY SCORING ---
 
-            // Higher Timeframe Trend (stärkstes Signal)
+            // Higher Timeframe Trend (Gewicht: 3)
             if (analyse.HtfTrend == TrendRichtung.Aufwaerts) buyScore += 3;
-            if (analyse.HtfTrend == TrendRichtung.Abwaerts) buyScore -= 2;
+            if (analyse.HtfTrend == TrendRichtung.Abwaerts) buyScore -= 3;
 
-            // EMA Trend
+            // 200 EMA Langfrist-Filter (Gewicht: 2)
+            if (analyse.UeberEma200) buyScore += 2;
+            else buyScore -= 1;
+
+            // EMA Trend (Gewicht: 2)
             if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
 
-            // ADX Trendstärke
-            if (analyse.IstTrendStark && analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 1;
+            // ADX + DI Richtung (Gewicht: 2)
+            if (analyse.IstTrendStark && analyse.DiPlus > analyse.DiMinus) buyScore += 2;
 
-            // RSI
+            // RSI Zone (Gewicht: 2)
             if (analyse.RsiUeberverkauft) buyScore += 2;
-            if (analyse.RsiWert < 45 && analyse.RsiWert > 30) buyScore += 1;
-            if (analyse.RsiUeberkauft) buyScore -= 2;
+            else if (analyse.RsiWert < 45 && analyse.RsiWert > 30) buyScore += 1;
+            if (analyse.RsiUeberkauft) buyScore -= 3;
 
-            // MACD
+            // RSI Divergenz (Gewicht: 3 - stark!)
+            if (analyse.RsiBullishDivergenz) buyScore += 3;
+
+            // MACD (Gewicht: 2)
             if (analyse.MacdBullishCross) buyScore += 2;
-            if (analyse.MacdHistogramm > 0 && analyse.MacdHistogramm > analyse.MacdHistogrammVorher) buyScore += 1;
+            if (analyse.MacdHistogramm > 0 && analyse.MacdMomentumSteigt) buyScore += 1;
 
-            // Bollinger Bands
+            // Bollinger (Gewicht: 1-2)
             if (analyse.PreisNahUnteremBand) buyScore += 1;
+            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
 
-            // Bullische Kerze
-            if (analyse.IstBullishKerze && analyse.KerzenKoerper > analyse.UntererDocht) buyScore += 1;
+            // Kerzenformationen (Gewicht: 2-3)
+            if (analyse.BullishEngulfing) buyScore += 3;
+            if (analyse.BullishPinBar) buyScore += 2;
+            if (analyse.StarkeMomentumKerze && analyse.IstBullishKerze) buyScore += 2;
+            else if (analyse.IstBullishKerze && analyse.KerzenKoerper > analyse.UntererDocht) buyScore += 1;
 
-            // --- SELL SCORING ---
+            // Regime-Bonus
+            if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Aufwaerts)
+                buyScore += 1;
 
-            // Higher Timeframe Trend
+            // --- GEWICHTETES SELL SCORING ---
+
             if (analyse.HtfTrend == TrendRichtung.Abwaerts) sellScore += 3;
-            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) sellScore -= 2;
+            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) sellScore -= 3;
 
-            // EMA Trend
+            if (!analyse.UeberEma200) sellScore += 2;
+            else sellScore -= 1;
+
             if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
 
-            // ADX Trendstärke
-            if (analyse.IstTrendStark && analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 1;
+            if (analyse.IstTrendStark && analyse.DiMinus > analyse.DiPlus) sellScore += 2;
 
-            // RSI
             if (analyse.RsiUeberkauft) sellScore += 2;
-            if (analyse.RsiWert > 55 && analyse.RsiWert < 70) sellScore += 1;
-            if (analyse.RsiUeberverkauft) sellScore -= 2;
+            else if (analyse.RsiWert > 55 && analyse.RsiWert < 70) sellScore += 1;
+            if (analyse.RsiUeberverkauft) sellScore -= 3;
 
-            // MACD
+            if (analyse.RsiBearishDivergenz) sellScore += 3;
+
             if (analyse.MacdBearishCross) sellScore += 2;
-            if (analyse.MacdHistogramm < 0 && analyse.MacdHistogramm < analyse.MacdHistogrammVorher) sellScore += 1;
+            if (analyse.MacdHistogramm < 0 && analyse.MacdMomentumSteigt) sellScore += 1;
 
-            // Bollinger Bands
             if (analyse.PreisNahOberemBand) sellScore += 1;
+            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
 
-            // Bärische Kerze
-            if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
+            if (analyse.BearishEngulfing) sellScore += 3;
+            if (analyse.BearishPinBar) sellScore += 2;
+            if (analyse.StarkeMomentumKerze && analyse.IstBearishKerze) sellScore += 2;
+            else if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
+
+            if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Abwaerts)
+                sellScore += 1;
 
             // --- ENTSCHEIDUNG ---
-            int minScore = 5; // Mindestens 5 Punkte für ein Signal
+            // In Konsolidierung strengeren Schwellenwert verwenden
+            int minScore = analyse.Regime == MarktRegime.Konsolidierung ? 7 : 5;
 
             if (buyScore >= minScore && buyScore > sellScore + 2)
             {
-                Print("BUY Signal - Score: {0} (Sell: {1}) | HTF: {2} | RSI: {3:F1} | ADX: {4:F1}",
-                    buyScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke);
-                return SignalTyp.Buy;
+                analyse.Signal = SignalTyp.Buy;
+                analyse.SignalScore = buyScore;
+                Print("BUY Score:{0} (Sell:{1}) | HTF:{2} | RSI:{3:F0} | ADX:{4:F0} | Regime:{5}",
+                    buyScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
-
-            if (sellScore >= minScore && sellScore > buyScore + 2)
+            else if (sellScore >= minScore && sellScore > buyScore + 2)
             {
-                Print("SELL Signal - Score: {0} (Buy: {1}) | HTF: {2} | RSI: {3:F1} | ADX: {4:F1}",
-                    sellScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke);
-                return SignalTyp.Sell;
+                analyse.Signal = SignalTyp.Sell;
+                analyse.SignalScore = sellScore;
+                Print("SELL Score:{0} (Buy:{1}) | HTF:{2} | RSI:{3:F0} | ADX:{4:F0} | Regime:{5}",
+                    sellScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
-
-            return SignalTyp.Kein;
         }
 
         // =====================================================================
-        // TRADE AUSFÜHREN
+        // TRADE AUSFÜHREN (VERBESSERT)
         // =====================================================================
 
-        private void FuehreTradeAus(MarktAnalyse analyse)
+        private void FuehreTradeAus(MarktAnalyse analyse, bool istPyramide)
         {
-            // Prüfen ob bereits max Positionen offen
-            var offenePositionen = Positions.FindAll(BotLabel, _marktSymbol.Name);
-            if (offenePositionen.Length >= _maxOpenPositions)
-            {
-                Print("Max offene Positionen ({0}) erreicht - kein neuer Trade", _maxOpenPositions);
+            var offene = Positions.FindAll(BotLabel, _marktSymbol.Name);
+            if (offene.Length >= _maxOpenPositions)
                 return;
-            }
 
-            // Cooldown prüfen
-            if ((Server.Time - _lastTradeTime).TotalMinutes < _signalCooldown * TimeframeZuMinuten(BotTimeframe))
-            {
-                Print("Signal-Cooldown aktiv - kein neuer Trade");
+            // Cooldown prüfen (kürzer bei Pyramide)
+            double cooldownMinuten = _signalCooldown * TimeframeZuMinuten(BotTimeframe);
+            if (istPyramide) cooldownMinuten *= 0.5;
+            if ((Server.Time - _lastTradeTime).TotalMinutes < cooldownMinuten)
                 return;
-            }
 
-            // ATR-basierte Level berechnen
+            // ATR-basierte Level
             double atr = analyse.AtrWert;
             double stopLossPips = AtrZuPips(atr * _atrMultiplierSL);
             double takeProfitPips = AtrZuPips(atr * _atrMultiplierTP);
 
-            // Minimale SL/TP-Distanz sicherstellen
+            // Dynamische TP-Extension bei starkem Trend
+            if (analyse.Regime == MarktRegime.StarkerTrend && analyse.SignalScore >= 8)
+            {
+                takeProfitPips *= 1.5;
+                Print("Starker Trend + hohes Signal -> TP extended auf {0:F1} Pips", takeProfitPips);
+            }
+
+            // Minimale Distanz
             double minPips = _marktSymbol.Spread * 3;
             stopLossPips = Math.Max(stopLossPips, minPips);
             takeProfitPips = Math.Max(takeProfitPips, minPips);
 
-            // Positionsgröße berechnen (risiko-basiert)
-            double positionsGroesse = BerechnePositionsGroesse(stopLossPips);
-            if (positionsGroesse < _marktSymbol.VolumeInUnitsMin)
-            {
-                Print("Berechnete Position zu klein - kein Trade");
-                return;
-            }
+            // Positionsgröße berechnen (Kelly-basiert + adaptive Anpassung)
+            double riskPercent = BerechneAdaptivesRisiko(analyse);
+            double positionsGroesse = BerechnePositionsGroesse(stopLossPips, riskPercent);
 
-            // Adaptive Risikoanpassung bei Verlustserie
-            if (_consecutiveLosses >= 3)
-            {
+            if (positionsGroesse < _marktSymbol.VolumeInUnitsMin)
+                return;
+
+            // Pyramide: halbe Größe
+            if (istPyramide)
                 positionsGroesse *= 0.5;
-                Print("Verlustserie ({0}) - Positionsgröße halbiert", _consecutiveLosses);
-            }
 
-            // Volume normalisieren
             positionsGroesse = _marktSymbol.NormalizeVolumeInUnits(positionsGroesse, RoundingMode.Down);
-
             if (positionsGroesse < _marktSymbol.VolumeInUnitsMin)
                 return;
 
-            // Trade platzieren
             TradeType richtung = analyse.Signal == SignalTyp.Buy ? TradeType.Buy : TradeType.Sell;
 
             var result = ExecuteMarketOrder(
-                richtung,
-                _marktSymbol.Name,
-                positionsGroesse,
-                BotLabel,
-                stopLossPips,
-                takeProfitPips
-            );
+                richtung, _marktSymbol.Name, positionsGroesse,
+                BotLabel, stopLossPips, takeProfitPips);
 
             if (result.IsSuccessful)
             {
                 _lastTradeTime = Server.Time;
-                Print("Trade eröffnet: {0} {1:F0} Einheiten {2} | SL: {3:F1} Pips | TP: {4:F1} Pips",
-                    richtung, positionsGroesse, _marktSymbol.Name, stopLossPips, takeProfitPips);
-            }
-            else
-            {
-                Print("Trade fehlgeschlagen: {0}", result.Error);
+                string typ = istPyramide ? "PYRAMIDE" : "NEU";
+                Print("{0} Trade: {1} {2:F0} Einheiten | SL:{3:F1} TP:{4:F1} Pips | Risiko:{5:F2}%",
+                    typ, richtung, positionsGroesse, stopLossPips, takeProfitPips, riskPercent);
             }
         }
 
         // =====================================================================
-        // POSITIONSGRÖSSE BERECHNEN
+        // POSITIONSGRÖ?E: KELLY-CRITERION + ADAPTIVES RISIKO
         // =====================================================================
 
-        private double BerechnePositionsGroesse(double stopLossPips)
+        private double BerechneAdaptivesRisiko(MarktAnalyse analyse)
         {
-            // Risikobetrag = Kontostand * Risikoprozent
-            double risikoBetrag = Account.Balance * (_riskPercent / 100.0);
+            double risk = _baseRiskPercent;
 
-            // Pip-Wert berechnen
+            // Kelly-Criterion wenn genug Daten vorhanden (min 20 Trades)
+            if (_totalWins + _totalLosses >= 20)
+            {
+                double kellyRisk = BerechneKellyRisiko();
+                // Verwende halbes Kelly (konservativ) als Obergrenze
+                risk = Math.Min(risk, kellyRisk);
+            }
+
+            // Anti-Martingale: Mehr riskieren nach Gewinnserie, weniger nach Verlusten
+            if (_consecutiveWins >= 3)
+                risk *= 1.25; // +25% nach 3 Gewinnen
+            else if (_consecutiveWins >= 2)
+                risk *= 1.1;  // +10% nach 2 Gewinnen
+
+            if (_consecutiveLosses >= 4)
+                risk *= 0.25; // -75% nach 4 Verlusten
+            else if (_consecutiveLosses >= 3)
+                risk *= 0.4;  // -60% nach 3 Verlusten
+            else if (_consecutiveLosses >= 2)
+                risk *= 0.65; // -35% nach 2 Verlusten
+
+            // Drawdown-Skalierung: Risiko reduzieren je näher am Max-Drawdown
+            _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
+            if (_currentDrawdown > _maxDrawdownPercent * 0.5)
+            {
+                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.5) / (_maxDrawdownPercent * 0.5));
+                risk *= Math.Max(0.2, ddFaktor);
+            }
+
+            // Signal-Score-Bonus: Starke Signale bekommen mehr Risiko
+            if (analyse.SignalScore >= 10) risk *= 1.3;
+            else if (analyse.SignalScore >= 8) risk *= 1.15;
+            else if (analyse.SignalScore < 6) risk *= 0.8;
+
+            // Regime-Anpassung
+            if (analyse.Regime == MarktRegime.Konsolidierung) risk *= 0.6;
+            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.1;
+
+            // Harte Grenzen
+            return Math.Max(0.1, Math.Min(risk, _baseRiskPercent * 2.0));
+        }
+
+        private double BerechneKellyRisiko()
+        {
+            double wr = WinRate();
+            double avgWin = _totalWins > 0 ? _summeGewinne / _totalWins : 1;
+            double avgLoss = _totalLosses > 0 ? _summeVerluste / _totalLosses : 1;
+
+            if (avgLoss <= 0) return _baseRiskPercent;
+
+            double payoffRatio = avgWin / avgLoss;
+
+            // Kelly-Formel: f = W - (1-W)/R
+            double kelly = wr - ((1.0 - wr) / payoffRatio);
+
+            // Halbes Kelly (konservativ), und minimal 0.1%
+            return Math.Max(0.1, kelly * 100.0 * 0.5);
+        }
+
+        private double BerechnePositionsGroesse(double stopLossPips, double riskPercent)
+        {
+            double risikoBetrag = Account.Balance * (riskPercent / 100.0);
             double pipValue = _marktSymbol.PipValue;
 
             if (pipValue <= 0 || stopLossPips <= 0)
                 return _marktSymbol.VolumeInUnitsMin;
 
-            // Positionsgröße = Risikobetrag / (SL in Pips * Pip-Wert)
-            double volume = risikoBetrag / (stopLossPips * pipValue);
-
-            return volume;
+            return risikoBetrag / (stopLossPips * pipValue);
         }
 
         // =====================================================================
-        // TRAILING STOP - BESTEHENDE POSITIONEN VERWALTEN
+        // POSITIONS-VERWALTUNG (MASSIV VERBESSERT)
         // =====================================================================
 
         private void VerwalteBestehendePositionen()
         {
             var positionen = Positions.FindAll(BotLabel, _marktSymbol.Name);
+            double atr = _atr.Result.Last(1);
 
             foreach (var position in positionen)
             {
-                double atr = _atr.Result.Last(1);
-                double trailingDistanzPips = AtrZuPips(atr * _trailingAtrMultiplier);
+                double atrPips = AtrZuPips(atr);
+                double slPips = AtrZuPips(atr * _atrMultiplierSL);
 
-                // Trailing Stop nur aktivieren, wenn Position im Gewinn ist
-                if (position.Pips > trailingDistanzPips)
+                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1R Gewinn
+                if (position.Pips > slPips && !IstBreakEven(position))
                 {
-                    double neuerSL;
+                    SetzeBreakEven(position);
+                }
 
+                // 2. PARTIAL CLOSE bei 2R Gewinn: 50% Position schließen
+                if (position.Pips > slPips * 2.0 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2)
+                {
+                    double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
+                        position.VolumeInUnits * 0.5, RoundingMode.Down);
+                    if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
+                    {
+                        ClosePosition(position, closeVolume);
+                        Print("PARTIAL CLOSE 50% bei +{0:F1} Pips (2R erreicht)", position.Pips);
+                    }
+                }
+
+                // 3. TRAILING STOP (nur bei Gewinn > 1.5R)
+                double trailingStart = slPips * 1.5;
+                if (position.Pips > trailingStart)
+                {
+                    double trailingDistanz = AtrZuPips(atr * _trailingAtrMultiplier);
+
+                    // Im starken Trend: weiterer Trailing Stop
+                    if (_aktuellesRegime == MarktRegime.StarkerTrend)
+                        trailingDistanz *= 1.3;
+
+                    double neuerSL;
                     if (position.TradeType == TradeType.Buy)
                     {
-                        neuerSL = _marktSymbol.Bid - (trailingDistanzPips * _marktSymbol.PipSize);
+                        neuerSL = _marktSymbol.Bid - (trailingDistanz * _marktSymbol.PipSize);
                         if (position.StopLoss == null || neuerSL > position.StopLoss)
-                        {
                             position.ModifyStopLossPrice(neuerSL);
-                        }
                     }
                     else
                     {
-                        neuerSL = _marktSymbol.Ask + (trailingDistanzPips * _marktSymbol.PipSize);
+                        neuerSL = _marktSymbol.Ask + (trailingDistanz * _marktSymbol.PipSize);
                         if (position.StopLoss == null || neuerSL < position.StopLoss)
-                        {
                             position.ModifyStopLossPrice(neuerSL);
-                        }
                     }
                 }
             }
+        }
+
+        private bool IstBreakEven(Position position)
+        {
+            if (position.StopLoss == null) return false;
+            double diff = Math.Abs(position.EntryPrice - position.StopLoss.Value);
+            return diff < _marktSymbol.PipSize * 3; // Innerhalb von 3 Pips = Break-Even
+        }
+
+        private void SetzeBreakEven(Position position)
+        {
+            // SL auf Entry + 1 Pip setzen (leichter Gewinn garantiert)
+            double bePriceOffset = _marktSymbol.PipSize * 1;
+            double bePrice;
+
+            if (position.TradeType == TradeType.Buy)
+                bePrice = position.EntryPrice + bePriceOffset;
+            else
+                bePrice = position.EntryPrice - bePriceOffset;
+
+            if (position.StopLoss == null ||
+                (position.TradeType == TradeType.Buy && bePrice > position.StopLoss) ||
+                (position.TradeType == TradeType.Sell && bePrice < position.StopLoss))
+            {
+                position.ModifyStopLossPrice(bePrice);
+                Print("BREAK-EVEN gesetzt bei +{0:F1} Pips", position.Pips);
+            }
+        }
+
+        // =====================================================================
+        // STALE-TRADE-TIMEOUT & AKTIVER REVERSAL-EXIT
+        // =====================================================================
+
+        private void PruefeStaleTradesUndReversals()
+        {
+            var positionen = Positions.FindAll(BotLabel, _marktSymbol.Name);
+
+            foreach (var position in positionen)
+            {
+                // Wie viele Bars ist die Position schon offen?
+                int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
+
+                // STALE TRADE: Position geht nirgendwohin
+                if (barsOffen >= _staleTradeBarCount && Math.Abs(position.Pips) < AtrZuPips(_atr.Result.Last(1) * 0.3))
+                {
+                    Print("STALE TRADE geschlossen nach {0} Bars bei {1:F1} Pips", barsOffen, position.Pips);
+                    ClosePosition(position);
+                    continue;
+                }
+
+                // REVERSAL-EXIT: Gegenläufiges Signal erkannt
+                bool sollSchliessen = false;
+
+                // RSI extrem gegen Position
+                double rsi = _rsi.Result.Last(1);
+                if (position.TradeType == TradeType.Buy && rsi > 80)
+                    sollSchliessen = true;
+                if (position.TradeType == TradeType.Sell && rsi < 20)
+                    sollSchliessen = true;
+
+                // EMA-Kreuzung gegen Position
+                double fast = _emaFast.Result.Last(1);
+                double medium = _emaMedium.Result.Last(1);
+                double fastVorher = _emaFast.Result.Last(2);
+                double mediumVorher = _emaMedium.Result.Last(2);
+
+                bool emaBearishCross = fastVorher >= mediumVorher && fast < medium;
+                bool emaBullishCross = fastVorher <= mediumVorher && fast > medium;
+
+                if (position.TradeType == TradeType.Buy && emaBearishCross && position.Pips > 0)
+                    sollSchliessen = true;
+                if (position.TradeType == TradeType.Sell && emaBullishCross && position.Pips > 0)
+                    sollSchliessen = true;
+
+                // MACD Umkehr gegen Position + Position schon im Gewinn
+                if (position.TradeType == TradeType.Buy && _macd.Histogram.Last(1) < 0
+                    && _macd.Histogram.Last(2) > 0 && position.Pips > AtrZuPips(_atr.Result.Last(1)))
+                {
+                    sollSchliessen = true;
+                }
+                if (position.TradeType == TradeType.Sell && _macd.Histogram.Last(1) > 0
+                    && _macd.Histogram.Last(2) < 0 && position.Pips > AtrZuPips(_atr.Result.Last(1)))
+                {
+                    sollSchliessen = true;
+                }
+
+                if (sollSchliessen)
+                {
+                    Print("REVERSAL-EXIT bei {0:F1} Pips (RSI:{1:F0})", position.Pips, rsi);
+                    ClosePosition(position);
+                }
+            }
+        }
+
+        // =====================================================================
+        // EREIGNIS-ERKENNUNG: GAP, SPREAD-SPIKE
+        // =====================================================================
+
+        private bool ErkenneGap()
+        {
+            if (_marktBars.ClosePrices.Count < 3)
+                return false;
+
+            double vorherigerClose = _marktBars.ClosePrices.Last(2);
+            double aktuellerOpen = _marktBars.OpenPrices.Last(1);
+            double atr = _atr.Result.Last(2);
+
+            if (atr <= 0) return false;
+
+            double gapGroesse = Math.Abs(aktuellerOpen - vorherigerClose);
+            return gapGroesse > atr * 2.0;
+        }
+
+        private void AktualisiereSpreadTracking()
+        {
+            double spread = _marktSymbol.Spread;
+            _spreadSampleCount++;
+            _avgSpread = _avgSpread + (spread - _avgSpread) / Math.Min(_spreadSampleCount, 100);
+            _lastSpread = spread;
+        }
+
+        private bool IstSpreadZuHoch()
+        {
+            if (_spreadSampleCount < 10) return false;
+            return _marktSymbol.Spread > _avgSpread * 3.0;
         }
 
         // =====================================================================
@@ -609,20 +1007,21 @@ namespace cAlgo.Robots
 
         private bool DarfHandeln()
         {
-            // Max Drawdown Check
-            _currentDrawdown = ((_initialBalance - Account.Balance) / _initialBalance) * 100;
+            _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
             if (_currentDrawdown >= _maxDrawdownPercent)
             {
-                Print("MAX DRAWDOWN erreicht ({0:F1}%) - Bot pausiert!", _currentDrawdown);
+                Print("MAX DRAWDOWN {0:F1}% erreicht - STOP!", _currentDrawdown);
                 return false;
             }
 
-            // Session-Filter: Nur während aktiver Marktzeiten handeln
             if (!IstAktiveHandelszeit())
                 return false;
 
-            // Wochenend-Filter
             if (Server.Time.DayOfWeek == DayOfWeek.Saturday || Server.Time.DayOfWeek == DayOfWeek.Sunday)
+                return false;
+
+            // Freitag-Abend: Keine neuen Trades (Gap-Risiko am Wochenende)
+            if (Server.Time.DayOfWeek == DayOfWeek.Friday && Server.Time.Hour >= 20)
                 return false;
 
             return true;
@@ -631,26 +1030,42 @@ namespace cAlgo.Robots
         private bool IstAktiveHandelszeit()
         {
             int stunde = Server.Time.Hour;
-
-            // Forex/Indizes: Haupthandelszeiten (London + New York overlap)
-            // UTC 07:00 - 21:00
             return stunde >= 7 && stunde <= 21;
         }
 
         // =====================================================================
-        // POSITIONS-EVENTS
+        // CLEANUP
         // =====================================================================
 
         protected override void OnStop()
         {
-            Print("=== FullAutoBot wird gestoppt ===");
-            Print("Endgültiger Kontostand: {0:F2} | Drawdown: {1:F1}%", Account.Balance, _currentDrawdown);
+            int total = _totalWins + _totalLosses;
+            Print("=== FullAutoBot v2 gestoppt ===");
+            Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
+                total, _totalWins, _totalLosses, WinRate() * 100);
+            if (_totalWins > 0 && _totalLosses > 0)
+            {
+                double avgW = _summeGewinne / _totalWins;
+                double avgL = _summeVerluste / _totalLosses;
+                Print("Avg Win: +{0:F1} Pips | Avg Loss: -{1:F1} Pips | Payoff: {2:F2}",
+                    avgW, avgL, avgW / Math.Max(avgL, 0.01));
+            }
+            Print("Balance: {0:F2} | Peak: {1:F2} | Drawdown: {2:F1}%",
+                Account.Balance, _peakBalance, _currentDrawdown);
+
             _marktBars.BarOpened -= OnBarOpened;
+            Positions.Closed -= OnPositionClosed;
         }
 
         // =====================================================================
         // HILFSFUNKTIONEN
         // =====================================================================
+
+        private double WinRate()
+        {
+            int total = _totalWins + _totalLosses;
+            return total > 0 ? (double)_totalWins / total : 0.5;
+        }
 
         private double AtrZuPips(double atrWert)
         {
@@ -685,66 +1100,71 @@ namespace cAlgo.Robots
             if (tf == TimeFrame.Day3) return 4320;
             if (tf == TimeFrame.Weekly) return 10080;
             if (tf == TimeFrame.Monthly) return 43200;
-            return 60; // Default: H1
+            return 60;
         }
 
         // =====================================================================
         // DATENSTRUKTUREN
         // =====================================================================
 
-        private enum TrendRichtung
-        {
-            Aufwaerts,
-            Abwaerts,
-            Seitwaerts
-        }
-
-        private enum SignalTyp
-        {
-            Kein,
-            Buy,
-            Sell
-        }
+        private enum TrendRichtung { Aufwaerts, Abwaerts, Seitwaerts }
+        private enum SignalTyp { Kein, Buy, Sell }
+        private enum MarktRegime { Unbekannt, StarkerTrend, MittlererTrend, SchwacherTrend, Konsolidierung }
 
         private class MarktAnalyse
         {
             // Trend
             public TrendRichtung HtfTrend { get; set; }
             public TrendRichtung EmaSignal { get; set; }
+            public bool UeberEma200 { get; set; }
             public double Trendstaerke { get; set; }
             public bool IstTrendStark { get; set; }
+            public double DiPlus { get; set; }
+            public double DiMinus { get; set; }
 
             // RSI
             public double RsiWert { get; set; }
+            public double RsiVorher { get; set; }
             public bool RsiUeberkauft { get; set; }
             public bool RsiUeberverkauft { get; set; }
-            public bool RsiNeutral { get; set; }
+            public bool RsiBullishDivergenz { get; set; }
+            public bool RsiBearishDivergenz { get; set; }
 
             // MACD
             public double MacdHistogramm { get; set; }
             public double MacdHistogrammVorher { get; set; }
+            public double MacdHistogrammVorVorher { get; set; }
             public bool MacdBullishCross { get; set; }
             public bool MacdBearishCross { get; set; }
+            public bool MacdMomentumSteigt { get; set; }
 
             // Bollinger Bands
             public bool PreisNahOberemBand { get; set; }
             public bool PreisNahUnteremBand { get; set; }
             public double BollingerBreite { get; set; }
+            public bool BollingerSqueeze { get; set; }
 
             // Volatilität
             public double AtrWert { get; set; }
             public double AtrProzent { get; set; }
             public bool VolatilitaetOk { get; set; }
 
-            // Kerzenformation
+            // Kerzenformationen
             public bool IstBullishKerze { get; set; }
             public bool IstBearishKerze { get; set; }
             public double KerzenKoerper { get; set; }
             public double ObererDocht { get; set; }
             public double UntererDocht { get; set; }
+            public bool BullishEngulfing { get; set; }
+            public bool BearishEngulfing { get; set; }
+            public bool BullishPinBar { get; set; }
+            public bool BearishPinBar { get; set; }
+            public bool StarkeMomentumKerze { get; set; }
 
-            // Ergebnis
+            // Regime + Signal
+            public MarktRegime Regime { get; set; }
             public SignalTyp Signal { get; set; }
+            public int SignalScore { get; set; }
         }
     }
 }
