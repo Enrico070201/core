@@ -1,24 +1,31 @@
 // ============================================================================
-// FullAutoBot v4.5 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.6 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
-// 10 Parameter für volle Kontrolle - Rest wird automatisch berechnet.
+// 8 Parameter für volle Kontrolle - Symbol & Timeframe automatisch vom Chart.
+//
+// AUTOMATISCH ERKANNT (vom Chart):
+//   - Symbol/Markt         - Das Instrument des Charts (EURUSD, GBPJPY, etc.)
+//   - Timeframe            - Der Zeitrahmen des Charts (M1 bis Monthly)
 //
 // PARAMETER:
-//   1. Timeframe          - Chart-Zeitrahmen (M1 bis Monthly)
-//   2. Markt (Symbol)     - Handelsinstrument (EURUSD, GBPJPY, etc.)
-//   3. Strategie-Modus    - 1=Konservativ, 2=Normal, 3=Aggressiv
-//   4. Basis-Risiko %     - Risiko pro Trade (0=Auto)
-//   5. Max Drawdown %     - Maximaler Drawdown bis Stop (0=Auto)
-//   6. Max Tagesverlust % - Tägliches Verlustlimit (0=Auto)
-//   7. Max Positionen     - Gleichzeitig offene Trades (0=Auto)
-//   8. Max Trades/Tag     - Übertrading-Schutz (0=Auto)
-//   9. Min Risk:Reward    - Mindest R:R Verhältnis (0=Auto, sonst 1.0-5.0)
-//  10. Take-Profit Faktor - TP-Multiplikator (0=Auto, 1.0=Standard, 2.0=doppelt)
+//   1. Strategie-Modus    - 1=Konservativ, 2=Normal, 3=Aggressiv
+//   2. Basis-Risiko %     - Risiko pro Trade (0=Auto)
+//   3. Max Drawdown %     - Maximaler Drawdown bis Stop (0=Auto)
+//   4. Max Tagesverlust % - Tägliches Verlustlimit (0=Auto)
+//   5. Max Positionen     - Gleichzeitig offene Trades (0=Auto)
+//   6. Max Trades/Tag     - Übertrading-Schutz (0=Auto)
+//   7. Min Risk:Reward    - Mindest R:R Verhältnis (0=Auto, sonst 1.0-5.0)
+//   8. Take-Profit Faktor - TP-Multiplikator (0=Auto, 1.0=Standard, 2.0=doppelt)
 //
 // STRATEGIE-MODUS:
 //   Konservativ: Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5, max 1 Trade/Richtung
 //   Normal:      Standard-Werte (ausgewogen)
 //   Aggressiv:   Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5, max 3 Trades/Richtung
+//
+// v4.6 Automatische Chart-Erkennung:
+//   - Symbol & Timeframe automatisch vom Chart erkannt (kein manuelles Setzen)
+//   - Bot einfach auf beliebigen Chart ziehen - funktioniert sofort
+//   - Parameter von 10 auf 8 reduziert (weniger Fehlerquellen)
 //
 // v4.5 Bug-Fixes & Optimierungen:
 //   - Kelly-Criterion Fix: Kelly begrenzt Risiko jetzt korrekt nach unten
@@ -136,18 +143,13 @@ namespace cAlgo.Robots
     public class FullAutoBot : Robot
     {
         // =====================================================================
-        // BENUTZER-PARAMETER (10 Stück - Rest wird automatisch berechnet)
+        // BENUTZER-PARAMETER (8 Stück - Symbol & Timeframe vom Chart erkannt)
         // =====================================================================
 
         // --- GRUNDEINSTELLUNGEN ---
+        // Symbol & Timeframe: Automatisch vom Chart erkannt (Symbol, TimeFrame, Bars)
 
-        [Parameter("1. Timeframe", DefaultValue = "Hour", Group = "Grundeinstellungen")]
-        public TimeFrame BotTimeframe { get; set; }
-
-        [Parameter("2. Markt (Symbol)", DefaultValue = "EURUSD", Group = "Grundeinstellungen")]
-        public string MarktSymbol { get; set; }
-
-        [Parameter("3. Strategie-Modus", DefaultValue = 2, MinValue = 1, MaxValue = 3, Group = "Grundeinstellungen")]
+        [Parameter("1. Strategie-Modus", DefaultValue = 2, MinValue = 1, MaxValue = 3, Group = "Grundeinstellungen")]
         public int StrategieModus { get; set; }
         // 1 = Konservativ (wenige Trades, hohe Qualität)
         // 2 = Normal (ausgewogen)
@@ -155,35 +157,35 @@ namespace cAlgo.Robots
 
         // --- RISIKO ---
 
-        [Parameter("4. Basis-Risiko %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Risiko")]
+        [Parameter("2. Basis-Risiko %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Risiko")]
         public double ParamBasisRisiko { get; set; }
         // 0.0 = Automatisch (vom Timeframe berechnet)
 
-        [Parameter("5. Max Drawdown %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 25.0, Step = 0.5, Group = "Risiko")]
+        [Parameter("3. Max Drawdown %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 25.0, Step = 0.5, Group = "Risiko")]
         public double ParamMaxDrawdown { get; set; }
         // 0.0 = Automatisch
 
-        [Parameter("6. Max Tagesverlust %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 10.0, Step = 0.5, Group = "Risiko")]
+        [Parameter("4. Max Tagesverlust %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 10.0, Step = 0.5, Group = "Risiko")]
         public double ParamMaxTagesverlust { get; set; }
         // 0.0 = Automatisch
 
         // --- TRADE-MANAGEMENT ---
 
-        [Parameter("7. Max offene Positionen", DefaultValue = 0, MinValue = 0, MaxValue = 5, Group = "Trade-Management")]
+        [Parameter("5. Max offene Positionen", DefaultValue = 0, MinValue = 0, MaxValue = 5, Group = "Trade-Management")]
         public int ParamMaxPositionen { get; set; }
         // 0 = Automatisch (2)
 
-        [Parameter("8. Max Trades pro Tag", DefaultValue = 0, MinValue = 0, MaxValue = 20, Group = "Trade-Management")]
+        [Parameter("6. Max Trades pro Tag", DefaultValue = 0, MinValue = 0, MaxValue = 20, Group = "Trade-Management")]
         public int ParamMaxTagesTrades { get; set; }
         // 0 = Automatisch (6)
 
         // --- TRADE-QUALITÄT ---
 
-        [Parameter("9. Min Risk:Reward", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
+        [Parameter("7. Min Risk:Reward", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
         public double ParamMinRiskReward { get; set; }
         // 0.0 = Automatisch (2.0, bzw. vom Strategie-Modus)
 
-        [Parameter("10. Take-Profit Faktor", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
+        [Parameter("8. Take-Profit Faktor", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
         public double ParamTpFaktor { get; set; }
         // 0.0 = Automatisch | 1.0 = Standard | 1.5 = 50% größere TPs | 2.0 = doppelte TPs
 
@@ -352,18 +354,13 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.5 gestartet ===");
-            Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
+            Print("=== FullAutoBot v4.6 gestartet ===");
+            Print("Markt: {0} | Timeframe: {1} (automatisch vom Chart erkannt)",
+                Symbol.Name, TimeFrame);
 
-            _marktSymbol = Symbols.GetSymbol(MarktSymbol);
-            if (_marktSymbol == null)
-            {
-                Print("FEHLER: Symbol {0} nicht gefunden!", MarktSymbol);
-                Stop();
-                return;
-            }
-
-            _marktBars = MarketData.GetBars(BotTimeframe, _marktSymbol.Name);
+            // v4.6: Symbol und Bars automatisch vom Chart - kein manuelles Setzen nötig
+            _marktSymbol = Symbol;
+            _marktBars = Bars;
 
             AdaptiereParameterAnTimeframe();
             UebernehmeBenuzerParameter();
@@ -520,7 +517,7 @@ namespace cAlgo.Robots
 
         private void AdaptiereParameterAnTimeframe()
         {
-            int tfMinuten = TimeframeZuMinuten(BotTimeframe);
+            int tfMinuten = TimeframeZuMinuten(TimeFrame);
 
             if (tfMinuten <= 5)
             {
@@ -607,7 +604,7 @@ namespace cAlgo.Robots
 
         private void InitialisiereHigherTimeframe()
         {
-            TimeFrame htf = ErmittleHigherTimeframe(BotTimeframe);
+            TimeFrame htf = ErmittleHigherTimeframe(TimeFrame);
             _higherTimeframeBars = MarketData.GetBars(htf, _marktSymbol.Name);
             _htfEmaFast = Indicators.ExponentialMovingAverage(_higherTimeframeBars.ClosePrices, 12);
             _htfEmaSlow = Indicators.ExponentialMovingAverage(_higherTimeframeBars.ClosePrices, 26);
@@ -1790,7 +1787,7 @@ namespace cAlgo.Robots
             }
 
             // Cooldown prüfen (kürzer bei Pyramide)
-            double cooldownMinuten = _signalCooldown * TimeframeZuMinuten(BotTimeframe);
+            double cooldownMinuten = _signalCooldown * TimeframeZuMinuten(TimeFrame);
             if (istPyramide) cooldownMinuten *= 0.5;
             if ((Server.Time - _lastTradeTime).TotalMinutes < cooldownMinuten)
                 return;
@@ -2216,7 +2213,7 @@ namespace cAlgo.Robots
             foreach (var position in positionen)
             {
                 // Wie viele Bars ist die Position schon offen?
-                int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
+                int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(TimeFrame));
 
                 // STALE TRADE: Position geht nirgendwohin
                 double atrPipsStale = AtrZuPips(_atr.Result.Last(1));
@@ -2404,7 +2401,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.5 gestoppt ===");
+            Print("=== FullAutoBot v4.6 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
