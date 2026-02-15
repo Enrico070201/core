@@ -1,8 +1,15 @@
 // ============================================================================
-// FullAutoBot v3 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v3.2 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
 // Alles andere wird automatisch berechnet und angepasst.
+//
+// v3.2 Fixes:
+//   - Warm-up Phase: Erste 10 Trades nur 50% Risiko (verhindert massive Verluste am Start)
+//   - Signal-Selektivität erhöht: minScore +1, Diff 3, Cooldown min 2
+//   - Risk-Cap gesenkt: Score-Multiplikatoren gedämpft, Max 2.0x Basis (vorher 2.5x)
+//   - Partial Close Fix: Einmal 40% statt wiederholte 25% (kein Micro-Close-Spam)
+//   - Max Open Positions auf 2 reduziert
 //
 // v3 Verbesserungen:
 //   - Flexibler HTF-Filter statt binärem Block (Seitwärts +1, Gegen +Sperre)
@@ -13,7 +20,7 @@
 //   - Konfluenz-Boost: Volle Zeitebenen-Übereinstimmung = +2
 //   - Break-Even bei 1.5R (nicht 1.0R - verhindert Ausstoppung)
 //   - Progressiver Trailing: enger je höher der Gewinn
-//   - Partial Close 25% bei 2.5R, 75% trailing lassen
+//   - Partial Close 40% bei 2.5R (einmalig), Rest trailing lassen
 //   - Anti-Martingale: 1 Verlust = normal, erst ab 2 bremsen
 //   - ADX-gewichtetes Risiko für Trend-Überzeugung
 // ============================================================================
@@ -139,6 +146,13 @@ namespace cAlgo.Robots
         private double _spreadVolatilitaet;
         private double _vorherigerAvgSpread;
 
+        // Warm-up Tracking: Erste Trades mit reduziertem Risiko
+        private int _totalTradeCount;
+        private const int WarmUpTrades = 10;
+
+        // Partial-Close Tracking: Verhindert wiederholte Micro-Closes
+        private readonly HashSet<int> _partialClosedPositions = new HashSet<int>();
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -147,7 +161,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v3 gestartet ===");
+            Print("=== FullAutoBot v3.2 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -185,6 +199,7 @@ namespace cAlgo.Robots
             _rollendeWinRate = 0.5;
             _spreadVolatilitaet = 0;
             _vorherigerAvgSpread = _marktSymbol.Spread;
+            _totalTradeCount = 0;
 
             // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
@@ -230,7 +245,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.0; _atrMultiplierTP = 4.0; _trailingAtrMultiplier = 1.5;
                 _baseRiskPercent = 1.6; _maxDrawdownPercent = 10.0;
-                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 18;
+                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 18;
             }
             else
             {
@@ -240,7 +255,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.5; _atrMultiplierTP = 5.5; _trailingAtrMultiplier = 2.0;
                 _baseRiskPercent = 2.2; _maxDrawdownPercent = 12.0;
-                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 14;
+                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 14;
             }
         }
 
@@ -295,6 +310,7 @@ namespace cAlgo.Robots
 
             double pips = pos.Pips;
             _tradeResultsPips.Add(pips);
+            _totalTradeCount++;
 
             bool istGewinn = pips > 0;
 
@@ -343,6 +359,9 @@ namespace cAlgo.Robots
                 istGewinn ? _consecutiveWins : _consecutiveLosses,
                 istGewinn ? "W" : "L",
                 _rollendeWinRate * 100, _rollendeErwartung, WinRate() * 100);
+
+            // Partial-Close-Tracking aufräumen
+            _partialClosedPositions.Remove(pos.Id);
 
             // Peak-Balance aktualisieren
             if (Account.Balance > _peakBalance)
@@ -878,19 +897,19 @@ namespace cAlgo.Robots
             // --- ENTSCHEIDUNG ---
             // v3: Flexibler HTF-Filter + Squeeze-Breakout in Konsolidierung
 
-            // Regime-adaptive Schwellenwerte
+            // Regime-adaptive Schwellenwerte (v3.2: +1 überall - weniger Trades, bessere Qualität)
             int minScore;
             switch (analyse.Regime)
             {
-                case MarktRegime.StarkerTrend: minScore = 6; break;
-                case MarktRegime.MittlererTrend: minScore = 6; break;
+                case MarktRegime.StarkerTrend: minScore = 7; break;   // vorher 6
+                case MarktRegime.MittlererTrend: minScore = 7; break;  // vorher 6
                 case MarktRegime.Konsolidierung:
                     // Konsolidierung: NUR Bollinger-Squeeze-Breakouts erlaubt
                     if (!analyse.BollingerSqueeze)
                         return;
-                    minScore = 8; // Muss absolut überzeugend sein
+                    minScore = 9; // vorher 8 - Muss absolut überzeugend sein
                     break;
-                default: minScore = 7; break; // SchwacherTrend
+                default: minScore = 8; break; // SchwacherTrend (vorher 7)
             }
 
             // HTF-Filter: Flexibel statt binärer Block
@@ -915,15 +934,15 @@ namespace cAlgo.Robots
             int buyMinScore = minScore + htfBuyAufschlag;
             int sellMinScore = minScore + htfSellAufschlag;
 
-            // Score-Differenz: Richtung muss klar sein
-            if (buyScore >= buyMinScore && buyScore > sellScore + 2)
+            // Score-Differenz: Richtung muss klar sein (v3.2: diff 3 statt 2)
+            if (buyScore >= buyMinScore && buyScore > sellScore + 3)
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
                 Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0} | Regime:{6}",
                     buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
-            else if (sellScore >= sellMinScore && sellScore > buyScore + 2)
+            else if (sellScore >= sellMinScore && sellScore > buyScore + 3)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
@@ -1033,6 +1052,15 @@ namespace cAlgo.Robots
         {
             double risk = _baseRiskPercent;
 
+            // === WARM-UP PHASE: Erste 10 Trades nur 50% Risiko ===
+            // Verhindert massive Verluste am Start wenn noch keine Daten vorhanden
+            if (_totalTradeCount < WarmUpTrades)
+            {
+                risk *= 0.5;
+                Print("WARM-UP: Trade {0}/{1} - halbes Risiko ({2:F2}%)",
+                    _totalTradeCount + 1, WarmUpTrades, risk);
+            }
+
             // Kelly-Criterion wenn genug Daten vorhanden (min 20 Trades)
             if (_totalWins + _totalLosses >= 20)
             {
@@ -1041,15 +1069,15 @@ namespace cAlgo.Robots
                 risk = Math.Min(risk * 1.5, kellyRisk);
             }
 
-            // === ADAPTIVE RISIKO-SKALIERUNG (v3: Event-Driven) ===
+            // === ADAPTIVE RISIKO-SKALIERUNG (v3.2: Gedämpft) ===
 
             // 1. Rolling Expectancy: Statt nur Streak, gesamte letzte Performance
             if (_rollendeErgebnissePips.Count >= 5)
             {
                 if (_rollendeErwartung > 5.0)
-                    risk *= 1.3;   // Bot läuft gut: mehr riskieren
+                    risk *= 1.2;   // Bot läuft gut: etwas mehr (vorher 1.3)
                 else if (_rollendeErwartung > 0)
-                    risk *= 1.1;   // Leicht positiv: minimal mehr
+                    risk *= 1.05;  // Leicht positiv: minimal (vorher 1.1)
                 else if (_rollendeErwartung < -5.0)
                     risk *= 0.5;   // Bot verliert: stark bremsen
                 else if (_rollendeErwartung < 0)
@@ -1058,7 +1086,7 @@ namespace cAlgo.Robots
 
             // 2. Consecutive als Zusatz-Sicherung (Streak-Breaker)
             if (_consecutiveWins >= 4)
-                risk *= 1.2;   // Heißer Lauf
+                risk *= 1.1;   // Heißer Lauf (vorher 1.2)
             if (_consecutiveLosses >= 3)
                 risk *= 0.4;   // Kalter Lauf - sofort bremsen
             else if (_consecutiveLosses >= 2)
@@ -1068,7 +1096,7 @@ namespace cAlgo.Robots
             if (_rollendeErgebnissePips.Count >= 5)
             {
                 if (_rollendeWinRate > 0.7)
-                    risk *= 1.15; // Hohe Trefferquote
+                    risk *= 1.1;  // Hohe Trefferquote (vorher 1.15)
                 else if (_rollendeWinRate < 0.35)
                     risk *= 0.6;  // Niedrige Trefferquote
             }
@@ -1081,19 +1109,19 @@ namespace cAlgo.Robots
                 risk *= Math.Max(0.2, ddFaktor);
             }
 
-            // 5. Signal-Score-Bonus: A+ Setups bekommen mehr Risiko
-            if (analyse.SignalScore >= 12) risk *= 2.0;
-            else if (analyse.SignalScore >= 10) risk *= 1.6;
-            else if (analyse.SignalScore >= 8) risk *= 1.3;
+            // 5. Signal-Score-Bonus: Gedämpft - max 1.5x statt 2.0x
+            if (analyse.SignalScore >= 12) risk *= 1.5;
+            else if (analyse.SignalScore >= 10) risk *= 1.3;
+            else if (analyse.SignalScore >= 8) risk *= 1.15;
 
             // 6. ADX-Trendstärke-Gewichtung
             if (analyse.Trendstaerke > 35)
-                risk *= 1.15;
+                risk *= 1.1;   // Vorher 1.15
             else if (analyse.Trendstaerke < 20)
                 risk *= 0.85;
 
             // 7. Regime-Anpassung
-            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.2;
+            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.15; // Vorher 1.2
 
             // 8. Volatilitäts-Regime: Bei extremer Vol runterfahren (Spikes = gefährlich)
             if (_volatilitaetsRatio > 2.0)
@@ -1101,8 +1129,8 @@ namespace cAlgo.Robots
             else if (_volatilitaetsRatio < 0.5)
                 risk *= 0.8; // Extreme Kontraktion: Wenig Bewegung erwartet
 
-            // Harte Grenzen: bis zu 2.5x Basis erlaubt
-            return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.5));
+            // Harte Grenzen: max 2.0x Basis (vorher 2.5x - zu aggressiv)
+            return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.0));
         }
 
         private double BerechneKellyRisiko()
@@ -1153,15 +1181,19 @@ namespace cAlgo.Robots
                     SetzeBreakEven(position);
                 }
 
-                // 2. PARTIAL CLOSE: 25% bei 2.5R sichern, Rest laufen lassen
-                if (position.Pips > slPips * 2.5 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 3)
+                // 2. PARTIAL CLOSE: EINMAL 40% bei 2.5R sichern, Rest laufen lassen
+                // v3.2: Tracking per Position-ID verhindert wiederholte Micro-Closes
+                if (position.Pips > slPips * 2.5
+                    && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2
+                    && !_partialClosedPositions.Contains(position.Id))
                 {
                     double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
-                        position.VolumeInUnits * 0.25, RoundingMode.Down);
+                        position.VolumeInUnits * 0.40, RoundingMode.Down);
                     if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
                     {
                         ClosePosition(position, closeVolume);
-                        Print("PARTIAL CLOSE 25% bei +{0:F1} Pips (2.5R erreicht)", position.Pips);
+                        _partialClosedPositions.Add(position.Id);
+                        Print("PARTIAL CLOSE 40% bei +{0:F1} Pips (2.5R erreicht) - einmalig", position.Pips);
                     }
                 }
 
@@ -1378,7 +1410,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v3 gestoppt ===");
+            Print("=== FullAutoBot v3.2 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
