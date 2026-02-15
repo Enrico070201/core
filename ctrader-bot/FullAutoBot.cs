@@ -107,6 +107,38 @@ namespace cAlgo.Robots
         private int _spreadSampleCount;
         private MarktRegime _aktuellesRegime;
 
+        // =====================================================================
+        // ADAPTIVE EVENT-TRACKING
+        // =====================================================================
+
+        // Rolling Performance: Letzte N Trades statt nur "consecutive"
+        private readonly Queue<double> _rollendeErgebnissePips = new Queue<double>();
+        private readonly Queue<TradeType> _rollendeRichtungen = new Queue<TradeType>();
+        private readonly Queue<bool> _rollendeErfolge = new Queue<bool>();
+        private const int RollendesFenster = 12;
+        private double _rollendeErwartung;
+        private double _rollendeWinRate;
+
+        // Volatilitäts-Regime: ATR(5) vs ATR(14) Ratio
+        private AverageTrueRange _atrKurz;
+        private double _volatilitaetsRatio; // >1 = expandierend, <1 = kontrahierend
+
+        // Regime-Wechsel-Tracking
+        private MarktRegime _vorherigesRegime;
+        private int _barsSeitRegimeWechsel;
+        private int _regimeWechselLetzten20Bars;
+        private readonly Queue<bool> _regimeWechselHistorie = new Queue<bool>();
+
+        // Richtungs-Bias: Lernt aus letzten Trade-Ergebnissen pro Richtung
+        private int _recentBuyWins;
+        private int _recentBuyLosses;
+        private int _recentSellWins;
+        private int _recentSellLosses;
+
+        // Spread-Volatilitäts-Tracking
+        private double _spreadVolatilitaet;
+        private double _vorherigerAvgSpread;
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -145,6 +177,14 @@ namespace cAlgo.Robots
             _avgSpread = _marktSymbol.Spread;
             _spreadSampleCount = 1;
             _aktuellesRegime = MarktRegime.Unbekannt;
+            _vorherigesRegime = MarktRegime.Unbekannt;
+            _barsSeitRegimeWechsel = 99;
+            _regimeWechselLetzten20Bars = 0;
+            _volatilitaetsRatio = 1.0;
+            _rollendeErwartung = 0;
+            _rollendeWinRate = 0.5;
+            _spreadVolatilitaet = 0;
+            _vorherigerAvgSpread = _marktSymbol.Spread;
 
             // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
@@ -219,6 +259,7 @@ namespace cAlgo.Robots
             _macd = Indicators.MacdCrossOver(close, 12, 26, 9);
             _bollingerBands = Indicators.BollingerBands(close, _bollingerPeriod, _bollingerStdDev, MovingAverageType.Exponential);
             _atr = Indicators.AverageTrueRange(_marktBars, _atrPeriod, MovingAverageType.Exponential);
+            _atrKurz = Indicators.AverageTrueRange(_marktBars, 5, MovingAverageType.Exponential);
             _adx = Indicators.DirectionalMovementSystem(_marktBars, _adxPeriod);
         }
 
@@ -255,14 +296,14 @@ namespace cAlgo.Robots
             double pips = pos.Pips;
             _tradeResultsPips.Add(pips);
 
-            if (pips > 0)
+            bool istGewinn = pips > 0;
+
+            if (istGewinn)
             {
                 _totalWins++;
                 _summeGewinne += pips;
                 _consecutiveWins++;
                 _consecutiveLosses = 0;
-                Print("WIN +{0:F1} Pips | Streak: {1}W | WR: {2:F1}%",
-                    pips, _consecutiveWins, WinRate() * 100);
             }
             else
             {
@@ -270,9 +311,38 @@ namespace cAlgo.Robots
                 _summeVerluste += Math.Abs(pips);
                 _consecutiveLosses++;
                 _consecutiveWins = 0;
-                Print("LOSS {0:F1} Pips | Streak: {1}L | WR: {2:F1}%",
-                    pips, _consecutiveLosses, WinRate() * 100);
             }
+
+            // Rolling Performance Window: Letzte N Trades
+            _rollendeErgebnissePips.Enqueue(pips);
+            _rollendeRichtungen.Enqueue(pos.TradeType);
+            _rollendeErfolge.Enqueue(istGewinn);
+            while (_rollendeErgebnissePips.Count > RollendesFenster)
+            {
+                _rollendeErgebnissePips.Dequeue();
+                var altRichtung = _rollendeRichtungen.Dequeue();
+                var altErfolg = _rollendeErfolge.Dequeue();
+                // Richtungs-Tracking rückbauen
+                if (altRichtung == TradeType.Buy)
+                { if (altErfolg) _recentBuyWins--; else _recentBuyLosses--; }
+                else
+                { if (altErfolg) _recentSellWins--; else _recentSellLosses--; }
+            }
+
+            // Richtungs-Tracking aufbauen
+            if (pos.TradeType == TradeType.Buy)
+            { if (istGewinn) _recentBuyWins++; else _recentBuyLosses++; }
+            else
+            { if (istGewinn) _recentSellWins++; else _recentSellLosses++; }
+
+            // Rolling Expectancy berechnen
+            AktualisiereRollendeErwartung();
+
+            Print("{0} {1:F1} Pips | Streak: {2}{3} | Roll-WR: {4:F0}% | Roll-Exp: {5:F1} | WR: {6:F1}%",
+                istGewinn ? "WIN +" : "LOSS", pips,
+                istGewinn ? _consecutiveWins : _consecutiveLosses,
+                istGewinn ? "W" : "L",
+                _rollendeWinRate * 100, _rollendeErwartung, WinRate() * 100);
 
             // Peak-Balance aktualisieren
             if (Account.Balance > _peakBalance)
@@ -288,18 +358,54 @@ namespace cAlgo.Robots
             // Spread-Tracking aktualisieren
             AktualisiereSpreadTracking();
 
+            // Volatilitäts-Regime aktualisieren
+            AktualisiereVolatilitaetsRegime();
+
             // Sicherheitschecks
             if (!DarfHandeln())
                 return;
 
-            // Markt-Regime erkennen
-            _aktuellesRegime = ErkenneMarktRegime();
+            // Markt-Regime erkennen mit Wechsel-Tracking
+            var neuesRegime = ErkenneMarktRegime();
+            bool regimeGewechselt = neuesRegime != _aktuellesRegime && _aktuellesRegime != MarktRegime.Unbekannt;
+
+            _regimeWechselHistorie.Enqueue(regimeGewechselt);
+            while (_regimeWechselHistorie.Count > 20)
+                _regimeWechselHistorie.Dequeue();
+            _regimeWechselLetzten20Bars = _regimeWechselHistorie.Count(x => x);
+
+            if (regimeGewechselt)
+            {
+                _vorherigesRegime = _aktuellesRegime;
+                _barsSeitRegimeWechsel = 0;
+                Print("REGIME-WECHSEL: {0} -> {1} | Wechsel/20: {2}",
+                    _vorherigesRegime, neuesRegime, _regimeWechselLetzten20Bars);
+            }
+            else
+            {
+                _barsSeitRegimeWechsel++;
+            }
+            _aktuellesRegime = neuesRegime;
 
             // Bestehende Positionen aktiv verwalten
             VerwalteBestehendePositionen();
 
             // Stale Trades prüfen und schließen
             PruefeStaleTradesUndReversals();
+
+            // Regime-Cooldown: Nach Wechsel 2 Bars warten (neues Regime muss sich bestätigen)
+            if (_barsSeitRegimeWechsel < 2)
+            {
+                Print("Regime-Cooldown: {0} Bars seit Wechsel - warte", _barsSeitRegimeWechsel);
+                return;
+            }
+
+            // Chop-Filter: Zu viele Regime-Wechsel = unentschlossener Markt = raushalten
+            if (_regimeWechselLetzten20Bars >= 5)
+            {
+                Print("CHOP erkannt: {0} Regime-Wechsel in 20 Bars - kein Trade", _regimeWechselLetzten20Bars);
+                return;
+            }
 
             // Aktuelle Werte auslesen
             int index = _marktBars.ClosePrices.Count - 2;
@@ -737,9 +843,33 @@ namespace cAlgo.Robots
             if (analyse.VolleKonfluenzSell) sellScore += 2;
 
             // --- SESSION-QUALITÄTS-BONUS ---
-            // London/NY Overlap = beste Liquidität = zuverlässigste Signale
             int stunde = Server.Time.Hour;
-            if (stunde >= 13 && stunde <= 16) // London + NY Overlap (UTC)
+            if (stunde >= 13 && stunde <= 16) // London/NY Overlap (UTC)
+            {
+                buyScore += 1;
+                sellScore += 1;
+            }
+
+            // --- RICHTUNGS-BIAS: Lernt aus letzten Ergebnissen ---
+            // Wenn Buys in letzter Zeit gut laufen -> Buy-Bonus
+            int recentBuyTotal = _recentBuyWins + _recentBuyLosses;
+            int recentSellTotal = _recentSellWins + _recentSellLosses;
+            if (recentBuyTotal >= 3)
+            {
+                double buyWR = (double)_recentBuyWins / recentBuyTotal;
+                if (buyWR >= 0.7) buyScore += 1;      // Buys laufen gut
+                else if (buyWR <= 0.3) buyScore -= 1;  // Buys versagen
+            }
+            if (recentSellTotal >= 3)
+            {
+                double sellWR = (double)_recentSellWins / recentSellTotal;
+                if (sellWR >= 0.7) sellScore += 1;
+                else if (sellWR <= 0.3) sellScore -= 1;
+            }
+
+            // --- VOLATILITÄTS-EXPANSION-BONUS ---
+            // Expandierende Volatilität = Markt bewegt sich = bessere Trade-Chance
+            if (_volatilitaetsRatio > 1.3)
             {
                 buyScore += 1;
                 sellScore += 1;
@@ -818,28 +948,47 @@ namespace cAlgo.Robots
             if ((Server.Time - _lastTradeTime).TotalMinutes < cooldownMinuten)
                 return;
 
-            // ATR-basierte Level
+            // ATR-basierte Level mit Vol-Ratio-Anpassung
             double atr = analyse.AtrWert;
-            double stopLossPips = AtrZuPips(atr * _atrMultiplierSL);
-            double takeProfitPips = AtrZuPips(atr * _atrMultiplierTP);
 
-            // Dynamische TP-Extension: Regime- und Score-basiert
+            // Volatilitäts-adaptive SL/TP-Multiplikatoren
+            // Expandierende Vol (>1.2): Breiterer SL (Rauschen), höherer TP (größere Moves)
+            // Kontrahierende Vol (<0.8): Engerer SL, kleinerer TP
+            double volAnpassungSL = 1.0;
+            double volAnpassungTP = 1.0;
+            if (_volatilitaetsRatio > 1.3)
+            {
+                volAnpassungSL = 1.15;  // 15% breiterer SL bei Vol-Expansion
+                volAnpassungTP = 1.25;  // 25% größeres TP (größere Moves erwartet)
+            }
+            else if (_volatilitaetsRatio < 0.75)
+            {
+                volAnpassungSL = 0.85;  // 15% engerer SL bei Vol-Kontraktion
+                volAnpassungTP = 0.85;  // 15% kleineres TP
+            }
+
+            double stopLossPips = AtrZuPips(atr * _atrMultiplierSL * volAnpassungSL);
+            double takeProfitPips = AtrZuPips(atr * _atrMultiplierTP * volAnpassungTP);
+
+            // Dynamische TP-Extension: Regime-, Score- und Vol-basiert
             double tpMultiplier = 1.0;
             if (analyse.Regime == MarktRegime.StarkerTrend)
                 tpMultiplier = 1.8;
             else if (analyse.Regime == MarktRegime.MittlererTrend)
                 tpMultiplier = 1.3;
 
-            // A+ Setups bekommen mindestens 1.4x TP unabhängig vom Regime
+            // A+ Setups bekommen mindestens 1.4x TP
             if (analyse.SignalScore >= 10)
                 tpMultiplier = Math.Max(tpMultiplier, 1.4);
 
             if (tpMultiplier > 1.0)
             {
                 takeProfitPips *= tpMultiplier;
-                Print("TP extended {0:F1}x -> {1:F1} Pips | Regime:{2} Score:{3}",
-                    tpMultiplier, takeProfitPips, analyse.Regime, analyse.SignalScore);
             }
+
+            Print("SL:{0:F1} TP:{1:F1} | VolRatio:{2:F2} | SL-Adj:{3:F2} TP-Adj:{4:F2} | TPx:{5:F1}",
+                stopLossPips, takeProfitPips, _volatilitaetsRatio,
+                volAnpassungSL, volAnpassungTP, tpMultiplier);
 
             // Minimale Distanz
             double minPips = _marktSymbol.Spread * 3;
@@ -892,23 +1041,39 @@ namespace cAlgo.Robots
                 risk = Math.Min(risk * 1.5, kellyRisk);
             }
 
-            // Anti-Martingale: 1 Verlust = normal (gehört dazu), erst ab 2 bremsen
+            // === ADAPTIVE RISIKO-SKALIERUNG (v3: Event-Driven) ===
+
+            // 1. Rolling Expectancy: Statt nur Streak, gesamte letzte Performance
+            if (_rollendeErgebnissePips.Count >= 5)
+            {
+                if (_rollendeErwartung > 5.0)
+                    risk *= 1.3;   // Bot läuft gut: mehr riskieren
+                else if (_rollendeErwartung > 0)
+                    risk *= 1.1;   // Leicht positiv: minimal mehr
+                else if (_rollendeErwartung < -5.0)
+                    risk *= 0.5;   // Bot verliert: stark bremsen
+                else if (_rollendeErwartung < 0)
+                    risk *= 0.7;   // Leicht negativ: etwas bremsen
+            }
+
+            // 2. Consecutive als Zusatz-Sicherung (Streak-Breaker)
             if (_consecutiveWins >= 4)
-                risk *= 1.4;  // +40% nach 4+ Gewinnen
-            else if (_consecutiveWins >= 3)
-                risk *= 1.25; // +25% nach 3 Gewinnen
-            else if (_consecutiveWins >= 2)
-                risk *= 1.15; // +15% nach 2 Gewinnen
-
-            if (_consecutiveLosses >= 4)
-                risk *= 0.25; // -75% nach 4+ Verlusten
-            else if (_consecutiveLosses >= 3)
-                risk *= 0.4;  // -60% nach 3 Verlusten
+                risk *= 1.2;   // Heißer Lauf
+            if (_consecutiveLosses >= 3)
+                risk *= 0.4;   // Kalter Lauf - sofort bremsen
             else if (_consecutiveLosses >= 2)
-                risk *= 0.6;  // -40% nach 2 Verlusten
-            // 1 Verlust: KEIN Abzug - normale Handelsrealität
+                risk *= 0.65;  // Warnung
 
-            // Drawdown-Skalierung: ab 50% des Max-DD bremsen
+            // 3. Rolling WinRate Anpassung
+            if (_rollendeErgebnissePips.Count >= 5)
+            {
+                if (_rollendeWinRate > 0.7)
+                    risk *= 1.15; // Hohe Trefferquote
+                else if (_rollendeWinRate < 0.35)
+                    risk *= 0.6;  // Niedrige Trefferquote
+            }
+
+            // 4. Drawdown-Skalierung: ab 50% des Max-DD bremsen
             _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
             if (_currentDrawdown > _maxDrawdownPercent * 0.5)
             {
@@ -916,19 +1081,25 @@ namespace cAlgo.Robots
                 risk *= Math.Max(0.2, ddFaktor);
             }
 
-            // Signal-Score-Bonus: A+ Setups bekommen mehr Risiko
-            if (analyse.SignalScore >= 12) risk *= 2.0;  // Jackpot-Setup: volle Ladung
+            // 5. Signal-Score-Bonus: A+ Setups bekommen mehr Risiko
+            if (analyse.SignalScore >= 12) risk *= 2.0;
             else if (analyse.SignalScore >= 10) risk *= 1.6;
             else if (analyse.SignalScore >= 8) risk *= 1.3;
 
-            // ADX-Trendstärke-Gewichtung: Starker Trend = mehr Überzeugung
+            // 6. ADX-Trendstärke-Gewichtung
             if (analyse.Trendstaerke > 35)
                 risk *= 1.15;
             else if (analyse.Trendstaerke < 20)
                 risk *= 0.85;
 
-            // Regime-Anpassung
+            // 7. Regime-Anpassung
             if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.2;
+
+            // 8. Volatilitäts-Regime: Bei extremer Vol runterfahren (Spikes = gefährlich)
+            if (_volatilitaetsRatio > 2.0)
+                risk *= 0.7; // Extreme Expansion: Vorsicht
+            else if (_volatilitaetsRatio < 0.5)
+                risk *= 0.8; // Extreme Kontraktion: Wenig Bewegung erwartet
 
             // Harte Grenzen: bis zu 2.5x Basis erlaubt
             return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.5));
@@ -1014,6 +1185,12 @@ namespace cAlgo.Robots
                     // Im starken Trend: etwas mehr Raum lassen
                     if (_aktuellesRegime == MarktRegime.StarkerTrend)
                         trailingDistanz *= 1.3;
+
+                    // Vol-Expansion: Breiterer Trail (mehr Noise)
+                    if (_volatilitaetsRatio > 1.3)
+                        trailingDistanz *= 1.15;
+                    else if (_volatilitaetsRatio < 0.75)
+                        trailingDistanz *= 0.85;
 
                     double neuerSL;
                     if (position.TradeType == TradeType.Buy)
@@ -1213,9 +1390,47 @@ namespace cAlgo.Robots
             }
             Print("Balance: {0:F2} | Peak: {1:F2} | Drawdown: {2:F1}%",
                 Account.Balance, _peakBalance, _currentDrawdown);
+            Print("Rolling Exp: {0:F1} | Rolling WR: {1:F0}% | Vol-Ratio: {2:F2}",
+                _rollendeErwartung, _rollendeWinRate * 100, _volatilitaetsRatio);
+            Print("Buy WR: {0}/{1} | Sell WR: {2}/{3}",
+                _recentBuyWins, _recentBuyWins + _recentBuyLosses,
+                _recentSellWins, _recentSellWins + _recentSellLosses);
 
             _marktBars.BarOpened -= OnBarOpened;
             Positions.Closed -= OnPositionClosed;
+        }
+
+        // =====================================================================
+        // ADAPTIVE METHODEN
+        // =====================================================================
+
+        private void AktualisiereVolatilitaetsRegime()
+        {
+            double atrKurz = _atrKurz.Result.Last(1);
+            double atrLang = _atr.Result.Last(1);
+
+            if (atrLang > 0)
+                _volatilitaetsRatio = atrKurz / atrLang;
+            else
+                _volatilitaetsRatio = 1.0;
+
+            // Spread-Volatilität tracken (wie stark schwankt der Spread)
+            double spreadDiff = Math.Abs(_avgSpread - _vorherigerAvgSpread);
+            _spreadVolatilitaet = _spreadVolatilitaet * 0.9 + spreadDiff * 0.1;
+            _vorherigerAvgSpread = _avgSpread;
+        }
+
+        private void AktualisiereRollendeErwartung()
+        {
+            if (_rollendeErgebnissePips.Count == 0)
+            {
+                _rollendeErwartung = 0;
+                _rollendeWinRate = 0.5;
+                return;
+            }
+
+            _rollendeErwartung = _rollendeErgebnissePips.Average();
+            _rollendeWinRate = (double)_rollendeErfolge.Count(x => x) / _rollendeErfolge.Count;
         }
 
         // =====================================================================
