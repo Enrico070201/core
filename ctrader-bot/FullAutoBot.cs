@@ -1,8 +1,19 @@
 // ============================================================================
-// FullAutoBot v3.3 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.0 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
 // Alles andere wird automatisch berechnet und angepasst.
+//
+// v4.0 Mustererkennung & Profitabilitäts-Upgrade:
+//   - Morning Star / Evening Star (3-Kerzen Umkehr, Gewicht 4)
+//   - Three White Soldiers / Three Black Crows (Continuation, Gewicht 3)
+//   - Inside Bar Breakout (Konsolidierungs-Ausbruch, Gewicht 2)
+//   - Doji an S/R Levels (Unsicherheit an Key-Levels, Gewicht 2)
+//   - Tweezer Top/Bottom (Doppel-Kerzen Umkehr, Gewicht 2)
+//   - Double Top/Bottom (Chart-Muster, Gewicht 3)
+//   - Support/Resistance aus Swing High/Low (50-Bar Lookback)
+//   - ADX-Dynamik: Steigend = Trend verstärkt sich (+2), Fallend = schwächt ab (-1)
+//   - S/R als Score-Bonus: Nah am Support = Buy-Bonus, nah am Widerstand = Sell-Bonus
 //
 // v3.3 Profitabilitäts-Upgrade:
 //   - Daily Loss Limit: Tageshandel stoppt nach X% Verlust (kein Revenge-Trading)
@@ -189,7 +200,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v3.3 gestartet ===");
+            Print("=== FullAutoBot v4.0 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -642,16 +653,25 @@ namespace cAlgo.Robots
             double atrVorher3 = _atr.Result.Last(3);
             analyse.AtrExpandiert = atrVorher3 > 0 && analyse.AtrWert > atrVorher3 * 1.1;
 
-            // 14. Volle Konfluenz: HTF + EMA + 200 EMA alle in gleicher Richtung
+            // 14. Support/Resistance Levels
+            ErkenneUnterstuetzungWiderstand(analyse);
+
+            // 15. Double Top/Bottom
+            ErkenneDoubleTopBottom(analyse);
+
+            // 16. ADX-Dynamik (steigend/fallend)
+            ErkenneAdxDynamik(analyse);
+
+            // 17. Volle Konfluenz: HTF + EMA + 200 EMA alle in gleicher Richtung
             analyse.VolleKonfluenzBuy = analyse.HtfTrend == TrendRichtung.Aufwaerts
                 && analyse.EmaSignal == TrendRichtung.Aufwaerts && analyse.UeberEma200;
             analyse.VolleKonfluenzSell = analyse.HtfTrend == TrendRichtung.Abwaerts
                 && analyse.EmaSignal == TrendRichtung.Abwaerts && !analyse.UeberEma200;
 
-            // 15. Markt-Regime
+            // 18. Markt-Regime
             analyse.Regime = _aktuellesRegime;
 
-            // 16. Gesamtsignal berechnen
+            // 19. Gesamtsignal berechnen
             BerechneGesamtSignal(analyse);
 
             return analyse;
@@ -700,6 +720,87 @@ namespace cAlgo.Robots
             if (gesamtRange > 0)
             {
                 analyse.StarkeMomentumKerze = koerper > gesamtRange * 0.75;
+            }
+
+            // === ERWEITERTE MUSTER (v4) ===
+
+            double close3 = _marktBars.ClosePrices.Last(3);
+            double open3 = _marktBars.OpenPrices.Last(3);
+            double high2 = _marktBars.HighPrices.Last(2);
+            double low2 = _marktBars.LowPrices.Last(2);
+            double high3 = _marktBars.HighPrices.Last(3);
+            double low3 = _marktBars.LowPrices.Last(3);
+
+            double koerper2 = Math.Abs(close2 - open2);
+            double koerper3 = Math.Abs(close3 - open3);
+            double range2 = high2 - low2;
+
+            // --- MORNING STAR (3-Kerzen Umkehr bullish) ---
+            // Bar 3: große bearish Kerze
+            // Bar 2: kleine Kerze (Doji-artig, Unsicherheit)
+            // Bar 1: große bullish Kerze, schließt über Mitte von Bar 3
+            bool bar3Bearish = close3 < open3 && koerper3 > (high3 - low3) * 0.5;
+            bool bar2Klein = range2 > 0 && koerper2 < range2 * 0.3;
+            bool bar1BullishStark = close1 > open1 && koerper > gesamtRange * 0.5
+                && close1 > (open3 + close3) / 2.0;
+            analyse.MorningStar = bar3Bearish && bar2Klein && bar1BullishStark;
+
+            // --- EVENING STAR (3-Kerzen Umkehr bearish) ---
+            bool bar3Bullish = close3 > open3 && koerper3 > (high3 - low3) * 0.5;
+            bool bar1BearishStark = close1 < open1 && koerper > gesamtRange * 0.5
+                && close1 < (open3 + close3) / 2.0;
+            analyse.EveningStar = bar3Bullish && bar2Klein && bar1BearishStark;
+
+            // --- THREE WHITE SOLDIERS (3 bullish Kerzen mit steigendem Close) ---
+            bool drei_bullish = close1 > open1 && close2 > open2 && close3 > open3;
+            bool steigend = close1 > close2 && close2 > close3;
+            bool kleine_dochte = gesamtRange > 0 && oberDocht < koerper * 0.3;
+            analyse.ThreeWhiteSoldiers = drei_bullish && steigend && kleine_dochte
+                && koerper > gesamtRange * 0.5 && koerper2 > range2 * 0.5;
+
+            // --- THREE BLACK CROWS (3 bearish Kerzen mit fallendem Close) ---
+            bool drei_bearish = close1 < open1 && close2 < open2 && close3 < open3;
+            bool fallend = close1 < close2 && close2 < close3;
+            bool kleine_unter_dochte = gesamtRange > 0 && unterDocht < koerper * 0.3;
+            analyse.ThreeBlackCrows = drei_bearish && fallend && kleine_unter_dochte
+                && koerper > gesamtRange * 0.5 && koerper2 > range2 * 0.5;
+
+            // --- INSIDE BAR BREAKOUT ---
+            // Bar 2 Range enthält Bar 1 komplett (Inside Bar)
+            // → Breakout-Richtung zeigt Continuation/Reversal
+            bool insideBar = high1 <= high2 && low1 >= low2;
+            if (_marktBars.ClosePrices.Count > 3)
+            {
+                double prevClose = _marktBars.ClosePrices.Last(3);
+                // Wurde die vorherige Bar zur Inside Bar? Bricht die aktuelle aus?
+                bool prevInsideBar = high2 <= high3 && low2 >= low3;
+                if (prevInsideBar)
+                {
+                    analyse.BullishInsideBarBreakout = close1 > high2;
+                    analyse.BearishInsideBarBreakout = close1 < low2;
+                }
+            }
+
+            // --- DOJI (Unsicherheits-Kerze) an Key-Levels ---
+            bool istDoji = gesamtRange > 0 && koerper < gesamtRange * 0.1;
+            if (istDoji)
+            {
+                analyse.DojiAnUnterstuetzung = analyse.PreisNahUnteremBand;
+                analyse.DojiAnWiderstand = analyse.PreisNahOberemBand;
+            }
+
+            // --- TWEEZER TOP/BOTTOM ---
+            // Zwei Kerzen mit nahezu identischem High (Top) oder Low (Bottom)
+            double toleranz = gesamtRange * 0.1;
+            if (toleranz > 0)
+            {
+                // Tweezer Bottom: Ähnliche Lows, Bar 1 bullish
+                analyse.BullishTweezerBottom = Math.Abs(low1 - low2) < toleranz
+                    && close1 > open1 && close2 < open2;
+
+                // Tweezer Top: Ähnliche Highs, Bar 1 bearish
+                analyse.BearishTweezerTop = Math.Abs(high1 - high2) < toleranz
+                    && close1 < open1 && close2 > open2;
             }
         }
 
@@ -751,6 +852,149 @@ namespace cAlgo.Robots
             }
 
             return preisHigh1 >= preisHigh5 * 0.999 && rsi1 < rsiAmHoch - 3 && rsi1 > 60;
+        }
+
+        // =====================================================================
+        // SUPPORT/RESISTANCE ERKENNUNG (v4: Swing High/Low basiert)
+        // =====================================================================
+
+        private void ErkenneUnterstuetzungWiderstand(MarktAnalyse analyse)
+        {
+            // Swing Highs/Lows der letzten 50 Bars finden
+            int lookback = 50;
+            int swingLen = 3; // 3 Bars links + 3 rechts = Swing-Punkt
+            double close = _marktBars.ClosePrices.Last(1);
+            double atr = _atr.Result.Last(1);
+            double toleranz = atr * 0.5; // S/R Zone statt exakter Preis
+
+            double naechsteUnterstuetzung = 0;
+            double naechsterWiderstand = double.MaxValue;
+
+            if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
+            {
+                analyse.NaechsteUnterstuetzung = 0;
+                analyse.NaechsterWiderstand = 0;
+                return;
+            }
+
+            for (int i = swingLen + 1; i < lookback; i++)
+            {
+                // Swing High: Höher als N Bars links und rechts
+                bool istSwingHigh = true;
+                bool istSwingLow = true;
+                double high_i = _marktBars.HighPrices.Last(i);
+                double low_i = _marktBars.LowPrices.Last(i);
+
+                for (int j = 1; j <= swingLen; j++)
+                {
+                    if (_marktBars.HighPrices.Last(i - j) >= high_i ||
+                        _marktBars.HighPrices.Last(i + j) >= high_i)
+                        istSwingHigh = false;
+
+                    if (_marktBars.LowPrices.Last(i - j) <= low_i ||
+                        _marktBars.LowPrices.Last(i + j) <= low_i)
+                        istSwingLow = false;
+                }
+
+                // Nächster Widerstand (über aktuellem Preis)
+                if (istSwingHigh && high_i > close && high_i < naechsterWiderstand)
+                    naechsterWiderstand = high_i;
+
+                // Nächste Unterstützung (unter aktuellem Preis)
+                if (istSwingLow && low_i < close && low_i > naechsteUnterstuetzung)
+                    naechsteUnterstuetzung = low_i;
+            }
+
+            analyse.NaechsteUnterstuetzung = naechsteUnterstuetzung;
+            analyse.NaechsterWiderstand = naechsterWiderstand == double.MaxValue ? 0 : naechsterWiderstand;
+
+            // Nah an S/R Level? (innerhalb 0.5 ATR)
+            if (naechsteUnterstuetzung > 0)
+                analyse.PreisNahUnterstuetzung = (close - naechsteUnterstuetzung) < toleranz;
+            if (naechsterWiderstand < double.MaxValue)
+                analyse.PreisNahWiderstand = (naechsterWiderstand - close) < toleranz;
+        }
+
+        // =====================================================================
+        // DOUBLE TOP/BOTTOM ERKENNUNG (v4)
+        // =====================================================================
+
+        private void ErkenneDoubleTopBottom(MarktAnalyse analyse)
+        {
+            int lookback = 40;
+            int swingLen = 3;
+            double close = _marktBars.ClosePrices.Last(1);
+            double atr = _atr.Result.Last(1);
+            double toleranz = atr * 0.3; // Wie nah müssen die Tops/Bottoms sein
+
+            if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
+                return;
+
+            // Sammle Swing Highs und Swing Lows
+            var swingHighs = new List<double>();
+            var swingLows = new List<double>();
+
+            for (int i = swingLen + 1; i < lookback; i++)
+            {
+                bool istSwingHigh = true;
+                bool istSwingLow = true;
+                double high_i = _marktBars.HighPrices.Last(i);
+                double low_i = _marktBars.LowPrices.Last(i);
+
+                for (int j = 1; j <= swingLen; j++)
+                {
+                    if (_marktBars.HighPrices.Last(i - j) >= high_i ||
+                        _marktBars.HighPrices.Last(i + j) >= high_i)
+                        istSwingHigh = false;
+
+                    if (_marktBars.LowPrices.Last(i - j) <= low_i ||
+                        _marktBars.LowPrices.Last(i + j) <= low_i)
+                        istSwingLow = false;
+                }
+
+                if (istSwingHigh) swingHighs.Add(high_i);
+                if (istSwingLow) swingLows.Add(low_i);
+            }
+
+            // Double Top: Zwei nahe beieinanderliegende Swing Highs, Preis fällt darunter
+            for (int i = 0; i < swingHighs.Count - 1; i++)
+            {
+                if (Math.Abs(swingHighs[i] - swingHighs[i + 1]) < toleranz
+                    && close < swingHighs[i] - atr * 0.5)
+                {
+                    analyse.DoubleTopErkannt = true;
+                    break;
+                }
+            }
+
+            // Double Bottom: Zwei nahe Swing Lows, Preis steigt darüber
+            for (int i = 0; i < swingLows.Count - 1; i++)
+            {
+                if (Math.Abs(swingLows[i] - swingLows[i + 1]) < toleranz
+                    && close > swingLows[i] + atr * 0.5)
+                {
+                    analyse.DoubleBottomErkannt = true;
+                    break;
+                }
+            }
+        }
+
+        // =====================================================================
+        // ADX-DYNAMIK ERKENNUNG (v4: Steigend = Trend verstärkt sich)
+        // =====================================================================
+
+        private void ErkenneAdxDynamik(MarktAnalyse analyse)
+        {
+            if (_adx.ADX.Count < 4) return;
+
+            double adx1 = _adx.ADX.Last(1);
+            double adx2 = _adx.ADX.Last(2);
+            double adx3 = _adx.ADX.Last(3);
+
+            // ADX steigend: Trend wird stärker (2 aufeinanderfolgende Anstiege)
+            analyse.AdxSteigend = adx1 > adx2 && adx2 > adx3;
+            // ADX fallend: Trend wird schwächer
+            analyse.AdxFallend = adx1 < adx2 && adx2 < adx3;
         }
 
         // =====================================================================
@@ -839,11 +1083,29 @@ namespace cAlgo.Robots
             if (analyse.PreisNahUnteremBand) buyScore += 1;
             if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
 
-            // Kerzenformationen (Gewicht: 2-3)
+            // Kerzenformationen Basis (Gewicht: 2-3)
             if (analyse.BullishEngulfing) buyScore += 3;
             if (analyse.BullishPinBar) buyScore += 2;
             if (analyse.StarkeMomentumKerze && analyse.IstBullishKerze) buyScore += 2;
             else if (analyse.IstBullishKerze && analyse.KerzenKoerper > analyse.UntererDocht) buyScore += 1;
+
+            // Erweiterte Kerzenmuster (v4, Gewicht: 2-4)
+            if (analyse.MorningStar) buyScore += 4;                   // Starkes Umkehrmuster
+            if (analyse.ThreeWhiteSoldiers) buyScore += 3;            // Starke Continuation
+            if (analyse.BullishInsideBarBreakout) buyScore += 2;      // Breakout-Signal
+            if (analyse.DojiAnUnterstuetzung) buyScore += 2;          // Unsicherheit am Support
+            if (analyse.BullishTweezerBottom) buyScore += 2;          // Doppelboden-Kerze
+
+            // Chart-Muster (v4, Gewicht: 3)
+            if (analyse.DoubleBottomErkannt) buyScore += 3;           // Double Bottom Breakout
+
+            // Support/Resistance (v4, Gewicht: 1-2)
+            if (analyse.PreisNahUnterstuetzung) buyScore += 2;        // Bounce am Support
+            if (analyse.PreisNahWiderstand) buyScore -= 1;            // Nahe am Widerstand = Risiko
+
+            // ADX-Dynamik (v4, Gewicht: 1-2)
+            if (analyse.AdxSteigend && analyse.IstTrendStark) buyScore += 2;  // Trend verstärkt sich
+            if (analyse.AdxFallend && analyse.Trendstaerke > 25) buyScore -= 1; // Trend schwächt ab
 
             // Regime-Bonus
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Aufwaerts)
@@ -899,6 +1161,24 @@ namespace cAlgo.Robots
             if (analyse.BearishPinBar) sellScore += 2;
             if (analyse.StarkeMomentumKerze && analyse.IstBearishKerze) sellScore += 2;
             else if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
+
+            // Erweiterte Kerzenmuster Sell (v4, Gewicht: 2-4)
+            if (analyse.EveningStar) sellScore += 4;
+            if (analyse.ThreeBlackCrows) sellScore += 3;
+            if (analyse.BearishInsideBarBreakout) sellScore += 2;
+            if (analyse.DojiAnWiderstand) sellScore += 2;
+            if (analyse.BearishTweezerTop) sellScore += 2;
+
+            // Chart-Muster Sell (v4, Gewicht: 3)
+            if (analyse.DoubleTopErkannt) sellScore += 3;
+
+            // S/R Sell (v4)
+            if (analyse.PreisNahWiderstand) sellScore += 2;
+            if (analyse.PreisNahUnterstuetzung) sellScore -= 1;
+
+            // ADX-Dynamik Sell (v4)
+            if (analyse.AdxSteigend && analyse.IstTrendStark) sellScore += 2;
+            if (analyse.AdxFallend && analyse.Trendstaerke > 25) sellScore -= 1;
 
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Abwaerts)
                 sellScore += 1;
@@ -992,15 +1272,22 @@ namespace cAlgo.Robots
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
-                Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0} | Regime:{6}",
-                    buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
+                // Erkannte Muster sammeln
+                string muster = ErkanntesMusterString(analyse, true);
+                Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0}{6} | Regime:{7} {8}",
+                    buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke,
+                    analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                    analyse.Regime, muster);
             }
             else if (sellScore >= sellMinScore && sellScore > buyScore + 3)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
-                Print("SELL Score:{0}/{1} (Buy:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0} | Regime:{6}",
-                    sellScore, sellMinScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
+                string musterSell = ErkanntesMusterString(analyse, false);
+                Print("SELL Score:{0}/{1} (Buy:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0}{6} | Regime:{7} {8}",
+                    sellScore, sellMinScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke,
+                    analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                    analyse.Regime, musterSell);
             }
         }
 
@@ -1603,7 +1890,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v3.3 gestoppt ===");
+            Print("=== FullAutoBot v4.0 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
@@ -1673,6 +1960,38 @@ namespace cAlgo.Robots
         private double AtrZuPips(double atrWert)
         {
             return atrWert / _marktSymbol.PipSize;
+        }
+
+        private string ErkanntesMusterString(MarktAnalyse a, bool isBuy)
+        {
+            var muster = new List<string>();
+            if (isBuy)
+            {
+                if (a.MorningStar) muster.Add("MorningStar");
+                if (a.ThreeWhiteSoldiers) muster.Add("3WS");
+                if (a.BullishInsideBarBreakout) muster.Add("InsideBreakout");
+                if (a.BullishEngulfing) muster.Add("BullEngulf");
+                if (a.BullishPinBar) muster.Add("PinBar");
+                if (a.BullishTweezerBottom) muster.Add("TweezerBot");
+                if (a.DojiAnUnterstuetzung) muster.Add("DojiSupport");
+                if (a.DoubleBottomErkannt) muster.Add("DoubleBottom");
+                if (a.PreisNahUnterstuetzung) muster.Add("@Support");
+                if (a.RsiBullishDivergenz) muster.Add("RSI-Div");
+            }
+            else
+            {
+                if (a.EveningStar) muster.Add("EveningStar");
+                if (a.ThreeBlackCrows) muster.Add("3BC");
+                if (a.BearishInsideBarBreakout) muster.Add("InsideBreakout");
+                if (a.BearishEngulfing) muster.Add("BearEngulf");
+                if (a.BearishPinBar) muster.Add("PinBar");
+                if (a.BearishTweezerTop) muster.Add("TweezerTop");
+                if (a.DojiAnWiderstand) muster.Add("DojiResist");
+                if (a.DoubleTopErkannt) muster.Add("DoubleTop");
+                if (a.PreisNahWiderstand) muster.Add("@Resist");
+                if (a.RsiBearishDivergenz) muster.Add("RSI-Div");
+            }
+            return muster.Count > 0 ? "| " + string.Join(", ", muster) : "";
         }
 
         private int TimeframeZuMinuten(TimeFrame tf)
@@ -1752,7 +2071,7 @@ namespace cAlgo.Robots
             public double AtrProzent { get; set; }
             public bool VolatilitaetOk { get; set; }
 
-            // Kerzenformationen
+            // Kerzenformationen (Basis)
             public bool IstBullishKerze { get; set; }
             public bool IstBearishKerze { get; set; }
             public double KerzenKoerper { get; set; }
@@ -1763,6 +2082,32 @@ namespace cAlgo.Robots
             public bool BullishPinBar { get; set; }
             public bool BearishPinBar { get; set; }
             public bool StarkeMomentumKerze { get; set; }
+
+            // Erweiterte Kerzenmuster (v4)
+            public bool MorningStar { get; set; }
+            public bool EveningStar { get; set; }
+            public bool ThreeWhiteSoldiers { get; set; }
+            public bool ThreeBlackCrows { get; set; }
+            public bool BullishInsideBarBreakout { get; set; }
+            public bool BearishInsideBarBreakout { get; set; }
+            public bool DojiAnUnterstuetzung { get; set; }
+            public bool DojiAnWiderstand { get; set; }
+            public bool BullishTweezerBottom { get; set; }
+            public bool BearishTweezerTop { get; set; }
+
+            // Chart-Muster (v4)
+            public bool DoubleBottomErkannt { get; set; }
+            public bool DoubleTopErkannt { get; set; }
+
+            // Support/Resistance
+            public double NaechsteUnterstuetzung { get; set; }
+            public double NaechsterWiderstand { get; set; }
+            public bool PreisNahUnterstuetzung { get; set; }
+            public bool PreisNahWiderstand { get; set; }
+
+            // ADX-Dynamik
+            public bool AdxSteigend { get; set; }
+            public bool AdxFallend { get; set; }
 
             // Momentum & Konfluenz
             public bool DreiBarsAufwaerts { get; set; }
