@@ -160,33 +160,33 @@ namespace cAlgo.Robots
 
             if (tfMinuten <= 5)
             {
-                // Scalping: aggressiv, schnelle Trades
+                // Scalping: wenige Trades, gutes R:R
                 _emaFastPeriod = 8; _emaMediumPeriod = 21; _emaSlowPeriod = 55;
                 _rsiPeriod = 10; _atrPeriod = 14; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 1.5; _atrMultiplierTP = 2.8; _trailingAtrMultiplier = 1.0;
-                _baseRiskPercent = 0.8; _maxDrawdownPercent = 8.0;
-                _maxOpenPositions = 3; _signalCooldown = 2; _staleTradeBarCount = 30;
+                _baseRiskPercent = 0.8; _maxDrawdownPercent = 6.0;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
             }
             else if (tfMinuten <= 30)
             {
-                // Intraday: gute Balance
+                // Intraday: Sniper-Modus
                 _emaFastPeriod = 10; _emaMediumPeriod = 25; _emaSlowPeriod = 50;
                 _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 1.8; _atrMultiplierTP = 3.5; _trailingAtrMultiplier = 1.2;
-                _baseRiskPercent = 1.2; _maxDrawdownPercent = 10.0;
-                _maxOpenPositions = 4; _signalCooldown = 1; _staleTradeBarCount = 25;
+                _baseRiskPercent = 1.2; _maxDrawdownPercent = 8.0;
+                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 25;
             }
             else if (tfMinuten <= 240)
             {
-                // Swing: großes R:R
+                // Swing: großes R:R, wenige Setups
                 _emaFastPeriod = 12; _emaMediumPeriod = 26; _emaSlowPeriod = 50;
                 _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.0; _atrMultiplierTP = 4.0; _trailingAtrMultiplier = 1.5;
-                _baseRiskPercent = 1.6; _maxDrawdownPercent = 12.0;
-                _maxOpenPositions = 4; _signalCooldown = 1; _staleTradeBarCount = 18;
+                _baseRiskPercent = 1.6; _maxDrawdownPercent = 10.0;
+                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 18;
             }
             else
             {
@@ -195,8 +195,8 @@ namespace cAlgo.Robots
                 _rsiPeriod = 14; _atrPeriod = 20; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 2.5; _atrMultiplierTP = 5.5; _trailingAtrMultiplier = 2.0;
-                _baseRiskPercent = 2.2; _maxDrawdownPercent = 15.0;
-                _maxOpenPositions = 5; _signalCooldown = 1; _staleTradeBarCount = 14;
+                _baseRiskPercent = 2.2; _maxDrawdownPercent = 12.0;
+                _maxOpenPositions = 3; _signalCooldown = 1; _staleTradeBarCount = 14;
             }
         }
 
@@ -335,7 +335,7 @@ namespace cAlgo.Robots
                         (analyse.Signal == SignalTyp.Buy && p.TradeType == TradeType.Buy) ||
                         (analyse.Signal == SignalTyp.Sell && p.TradeType == TradeType.Sell));
 
-                    if (bestehende.Pips > AtrZuPips(_atr.Result.Last(1) * 0.7) && analyse.SignalScore >= 5)
+                    if (bestehende.Pips > AtrZuPips(_atr.Result.Last(1) * 1.5) && analyse.SignalScore >= 8)
                     {
                         Print("PYRAMIDING: Bestehende Pos +{0:F1} Pips, Score {1} - verstärke",
                             bestehende.Pips, analyse.SignalScore);
@@ -729,24 +729,33 @@ namespace cAlgo.Robots
             if (analyse.VolleKonfluenzSell) sellScore += 1;
 
             // --- ENTSCHEIDUNG ---
-            // Regime-adaptive Schwellenwerte: Starke Trends brauchen weniger Score
+            // SNIPER-MODUS: Nur hochqualitative Setups, dafür mit voller Ladung
+            // Konsolidierung = kein Trade (zu viele Fehlsignale)
+            if (analyse.Regime == MarktRegime.Konsolidierung)
+                return;
+
+            // Regime-adaptive Schwellenwerte: Höhere Qualität = bessere Trades
             int minScore;
             switch (analyse.Regime)
             {
-                case MarktRegime.StarkerTrend: minScore = 4; break;
-                case MarktRegime.MittlererTrend: minScore = 5; break;
-                case MarktRegime.Konsolidierung: minScore = 7; break;
-                default: minScore = 5; break;
+                case MarktRegime.StarkerTrend: minScore = 6; break;
+                case MarktRegime.MittlererTrend: minScore = 7; break;
+                default: minScore = 8; break; // SchwacherTrend
             }
 
-            if (buyScore >= minScore && buyScore > sellScore + 1)
+            // HTF-Pflicht: Nur in Richtung des übergeordneten Trends traden
+            bool htfErlaubtBuy = analyse.HtfTrend == TrendRichtung.Aufwaerts;
+            bool htfErlaubtSell = analyse.HtfTrend == TrendRichtung.Abwaerts;
+
+            // Score-Differenz muss eindeutig sein (kein "vielleicht")
+            if (buyScore >= minScore && buyScore > sellScore + 3 && htfErlaubtBuy)
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
                 Print("BUY Score:{0} (Sell:{1}) | HTF:{2} | RSI:{3:F0} | ADX:{4:F0} | Regime:{5}",
                     buyScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
-            else if (sellScore >= minScore && sellScore > buyScore + 1)
+            else if (sellScore >= minScore && sellScore > buyScore + 3 && htfErlaubtSell)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
@@ -800,9 +809,9 @@ namespace cAlgo.Robots
             if (positionsGroesse < _marktSymbol.VolumeInUnitsMin)
                 return;
 
-            // Pyramide: 66% Größe (aggressiver nachlegen)
+            // Pyramide: halbe Größe (kontrolliert nachlegen)
             if (istPyramide)
-                positionsGroesse *= 0.66;
+                positionsGroesse *= 0.5;
 
             positionsGroesse = _marktSymbol.NormalizeVolumeInUnits(positionsGroesse, RoundingMode.Down);
             if (positionsGroesse < _marktSymbol.VolumeInUnitsMin)
@@ -835,46 +844,43 @@ namespace cAlgo.Robots
             if (_totalWins + _totalLosses >= 20)
             {
                 double kellyRisk = BerechneKellyRisiko();
-                // Verwende 65% Kelly als Obergrenze (aggressiver)
-                risk = Math.Max(risk, Math.Min(kellyRisk, _baseRiskPercent * 2.5));
+                // Halbes Kelly als Sicherheitsnetz
+                risk = Math.Min(risk * 1.5, kellyRisk);
             }
 
-            // Anti-Martingale: Aggressiver nach Gewinnen, defensiv nach Verlusten
-            if (_consecutiveWins >= 4)
-                risk *= 1.5;  // +50% nach 4 Gewinnen
-            else if (_consecutiveWins >= 3)
-                risk *= 1.35; // +35% nach 3 Gewinnen
+            // Anti-Martingale: Moderat nach Gewinnen hoch, schnell runter nach Verlusten
+            if (_consecutiveWins >= 3)
+                risk *= 1.3;  // +30% nach 3 Gewinnen
             else if (_consecutiveWins >= 2)
-                risk *= 1.2;  // +20% nach 2 Gewinnen
+                risk *= 1.15; // +15% nach 2 Gewinnen
 
-            if (_consecutiveLosses >= 4)
-                risk *= 0.3;  // -70% nach 4 Verlusten
-            else if (_consecutiveLosses >= 3)
-                risk *= 0.5;  // -50% nach 3 Verlusten
+            if (_consecutiveLosses >= 3)
+                risk *= 0.3;  // -70% nach 3 Verlusten - SOFORT bremsen
             else if (_consecutiveLosses >= 2)
-                risk *= 0.7;  // -30% nach 2 Verlusten
+                risk *= 0.5;  // -50% nach 2 Verlusten
+            else if (_consecutiveLosses >= 1)
+                risk *= 0.75; // -25% nach 1 Verlust
 
-            // Drawdown-Skalierung: Risiko erst ab 60% des Max-Drawdown reduzieren
+            // Drawdown-Skalierung: Risiko ab 40% des Max-Drawdown reduzieren (früher bremsen)
             _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
-            if (_currentDrawdown > _maxDrawdownPercent * 0.6)
+            if (_currentDrawdown > _maxDrawdownPercent * 0.4)
             {
-                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.6) / (_maxDrawdownPercent * 0.4));
-                risk *= Math.Max(0.25, ddFaktor);
+                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.4) / (_maxDrawdownPercent * 0.6));
+                risk *= Math.Max(0.15, ddFaktor);
             }
 
-            // Signal-Score-Bonus: Starke Signale bekommen deutlich mehr Risiko
-            if (analyse.SignalScore >= 12) risk *= 1.6;
-            else if (analyse.SignalScore >= 10) risk *= 1.4;
-            else if (analyse.SignalScore >= 8) risk *= 1.2;
-            else if (analyse.SignalScore < 5) risk *= 0.75;
+            // Signal-Score-Bonus: NUR A+ Setups bekommen mehr Risiko
+            // Durch die hohen Schwellen (6-8) kommen nur gute Signale durch
+            if (analyse.SignalScore >= 12) risk *= 2.0;  // Jackpot-Setup: volle Ladung
+            else if (analyse.SignalScore >= 10) risk *= 1.6;
+            else if (analyse.SignalScore >= 8) risk *= 1.3;
+            // Kein Abzug nötig - schlechte Scores kommen gar nicht durch den Filter
 
             // Regime-Anpassung
-            if (analyse.Regime == MarktRegime.Konsolidierung) risk *= 0.5;
-            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.25;
-            if (analyse.Regime == MarktRegime.MittlererTrend) risk *= 1.1;
+            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.3;
 
-            // Harte Grenzen: bis zu 3x Basis erlaubt
-            return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 3.0));
+            // Harte Grenzen: bis zu 2.5x Basis erlaubt
+            return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.5));
         }
 
         private double BerechneKellyRisiko()
@@ -890,8 +896,8 @@ namespace cAlgo.Robots
             // Kelly-Formel: f = W - (1-W)/R
             double kelly = wr - ((1.0 - wr) / payoffRatio);
 
-            // 65% Kelly (aggressiver), und minimal 0.15%
-            return Math.Max(0.15, kelly * 100.0 * 0.65);
+            // Halbes Kelly (bewährt sicher), minimal 0.15%
+            return Math.Max(0.15, kelly * 100.0 * 0.5);
         }
 
         private double BerechnePositionsGroesse(double stopLossPips, double riskPercent)
@@ -919,8 +925,8 @@ namespace cAlgo.Robots
                 double atrPips = AtrZuPips(atr);
                 double slPips = AtrZuPips(atr * _atrMultiplierSL);
 
-                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1.5R Gewinn
-                if (position.Pips > slPips * 1.5 && !IstBreakEven(position))
+                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1.0R Gewinn (Kapital schützen)
+                if (position.Pips > slPips * 1.0 && !IstBreakEven(position))
                 {
                     SetzeBreakEven(position);
                 }
@@ -1122,8 +1128,8 @@ namespace cAlgo.Robots
         private bool IstAktiveHandelszeit()
         {
             int stunde = Server.Time.Hour;
-            // Erweitert: Ab 6 Uhr (London Pre-Market) bis 21 Uhr
-            return stunde >= 6 && stunde <= 21;
+            // Nur Hauptsessions: London + NY Overlap (beste Liquidität)
+            return stunde >= 8 && stunde <= 20;
         }
 
         // =====================================================================
