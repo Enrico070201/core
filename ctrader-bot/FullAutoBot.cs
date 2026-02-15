@@ -1,5 +1,5 @@
 // ============================================================================
-// FullAutoBot v4.7 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.8 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // 8 Parameter für volle Kontrolle - Symbol & Timeframe automatisch vom Chart.
 //
@@ -37,6 +37,25 @@
 //   - HTF-Trend-Stärke als Bonus bei starkem Higher-Timeframe-Signal
 //   LOGGING:
 //   - Kategorie-Count (Kat:3/4), HTF-Stärke, RSI-Richtung, EMA-Fan-Out, Trend-Alter
+//
+// v4.8 Muster-Erinnerungsfunktion (Pattern Memory):
+//   LERNFÄHIGES SCORING:
+//   - Bot merkt sich welche Muster (Engulfing, PinBar, BoS, etc.) gewonnen/verloren haben
+//   - Gewichteter Decay (0.92 pro Trade): Neuere Ergebnisse zählen mehr als alte
+//   - Profitables Muster (WR>70%): +1.5 Score-Bonus
+//   - Verlustmuster (WR<30%): -2.0 Score-Strafe (Warnung vor schlechten Mustern)
+//   KONTEXT-BEWUSST:
+//   - Muster werden mit Kontext gespeichert: "BullEngulf@Support" vs "BullEngulf"
+//   - Trend-Kontext: "3WS+StarkTrend" vs "3WS" (Three White Soldiers im starken Trend)
+//   - Regime-Kontext: Marktregime wird pro Trade getrackt
+//   KOMBINATIONEN:
+//   - 2er-Kombinationen von Mustern werden extra getrackt ("BullEngulf+BoS-Bull")
+//   - Kombinationen die historisch gewinnen: +2.0 Bonus
+//   - Toxische Kombinationen (WR<25%): -2.5 Strafe
+//   PERIODISCHES LOGGING:
+//   - Alle 10 Trades: Top 3 + Bottom 3 Muster mit Win-Rates
+//   - Beste Kombinationen werden angezeigt
+//   - Score enthält "Mem:+3" oder "Mem:-2" für Transparenz
 //
 // v4.6 Automatische Chart-Erkennung:
 //   - Symbol & Timeframe automatisch vom Chart erkannt (kein manuelles Setzen)
@@ -367,6 +386,12 @@ namespace cAlgo.Robots
         private TrendRichtung _letzteEmaRichtung;
         private double _htfTrendStaerke; // 0-1, wie klar ist der HTF-Trend
 
+        // v4.8: Muster-Erinnerung - lernt welche Muster profitabel sind
+        private readonly Dictionary<string, MusterStatistik> _musterErinnerung = new Dictionary<string, MusterStatistik>();
+        private readonly Dictionary<long, List<string>> _tradeMuster = new Dictionary<long, List<string>>();
+        private readonly Dictionary<long, List<string>> _tradeMusterKombis = new Dictionary<long, List<string>>();
+        private int _musterLogCounter; // Zählt Trades für periodisches Logging
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -375,7 +400,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.7 gestartet ===");
+            Print("=== FullAutoBot v4.8 gestartet (mit Muster-Erinnerung) ===");
             Print("Markt: {0} | Timeframe: {1} (automatisch vom Chart erkannt)",
                 Symbol.Name, TimeFrame);
 
@@ -708,6 +733,35 @@ namespace cAlgo.Robots
                 istGewinn ? _consecutiveWins : _consecutiveLosses,
                 istGewinn ? "W" : "L",
                 _rollendeWinRate * 100, _rollendeErwartung, WinRate() * 100);
+
+            // v4.8: Muster-Erinnerung aktualisieren
+            long posId = pos.Id;
+            if (_tradeMuster.TryGetValue(posId, out var musterListe))
+            {
+                foreach (var musterName in musterListe)
+                {
+                    if (!_musterErinnerung.ContainsKey(musterName))
+                        _musterErinnerung[musterName] = new MusterStatistik();
+                    _musterErinnerung[musterName].AddErgebnis(istGewinn);
+                }
+                _tradeMuster.Remove(posId);
+            }
+            if (_tradeMusterKombis.TryGetValue(posId, out var kombiListe))
+            {
+                foreach (var kombiName in kombiListe)
+                {
+                    string key = "K:" + kombiName;
+                    if (!_musterErinnerung.ContainsKey(key))
+                        _musterErinnerung[key] = new MusterStatistik();
+                    _musterErinnerung[key].AddErgebnis(istGewinn);
+                }
+                _tradeMusterKombis.Remove(posId);
+            }
+
+            // Periodisches Muster-Logging (alle 10 Trades)
+            _musterLogCounter++;
+            if (_musterLogCounter % 10 == 0)
+                LoggeMusterErinnerung();
 
             // Partial-Close-Tracking aufräumen
             _partialClosedPositions.Remove(pos.Id);
@@ -1794,6 +1848,30 @@ namespace cAlgo.Robots
             analyse.KonfluenzKategorien = Math.Max(buyKategorien, sellKategorien);
 
             // ================================================================
+            // v4.8: MUSTER-ERINNERUNG - Historische Pattern-Performance
+            // Passt Score an basierend auf welche Muster in der Vergangenheit
+            // profitabel waren und welche nicht
+            // ================================================================
+
+            int buyMusterBonus = 0;
+            int sellMusterBonus = 0;
+
+            if (_musterErinnerung.Count > 0)
+            {
+                // Buy-Muster bewerten
+                var buyMuster = ExtrahiereMusterFuerErinnerung(analyse, true);
+                var buyKombis = ErstelleMusterKombinationen(buyMuster);
+                buyMusterBonus = BerechneMusterErinnerungsBonus(buyMuster, buyKombis);
+                buyScore += buyMusterBonus;
+
+                // Sell-Muster bewerten
+                var sellMuster = ExtrahiereMusterFuerErinnerung(analyse, false);
+                var sellKombis = ErstelleMusterKombinationen(sellMuster);
+                sellMusterBonus = BerechneMusterErinnerungsBonus(sellMuster, sellKombis);
+                sellScore += sellMusterBonus;
+            }
+
+            // ================================================================
             // ENTSCHEIDUNG
             // ================================================================
 
@@ -1850,8 +1928,9 @@ namespace cAlgo.Robots
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
                 string muster = ErkanntesMusterString(analyse, true);
-                Print("BUY Score:{0}/{1} (Sell:{2}) Kat:{3}/4 | HTF:{4}({5:F0}%) | RSI:{6:F0}{7} | ADX:{8:F0}{9} | EMA-Fan:{10:F2}% | TrendAge:{11} | Regime:{12} {13}",
-                    buyScore, buyMinScore, sellScore, buyKategorien,
+                string memStr = buyMusterBonus != 0 ? string.Format(" | Mem:{0:+#;-#;0}", buyMusterBonus) : "";
+                Print("BUY Score:{0}/{1} (Sell:{2}) Kat:{3}/4{4} | HTF:{5}({6:F0}%) | RSI:{7:F0}{8} | ADX:{9:F0}{10} | EMA-Fan:{11:F2}% | TrendAge:{12} | Regime:{13} {14}",
+                    buyScore, buyMinScore, sellScore, buyKategorien, memStr,
                     analyse.HtfTrend, analyse.HtfTrendStaerke * 100,
                     analyse.RsiWert, analyse.RsiSteigend ? "↑" : (analyse.RsiFallend ? "↓" : ""),
                     analyse.Trendstaerke, analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
@@ -1863,8 +1942,9 @@ namespace cAlgo.Robots
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
                 string musterSell = ErkanntesMusterString(analyse, false);
-                Print("SELL Score:{0}/{1} (Buy:{2}) Kat:{3}/4 | HTF:{4}({5:F0}%) | RSI:{6:F0}{7} | ADX:{8:F0}{9} | EMA-Fan:{10:F2}% | TrendAge:{11} | Regime:{12} {13}",
-                    sellScore, sellMinScore, buyScore, sellKategorien,
+                string memStrS = sellMusterBonus != 0 ? string.Format(" | Mem:{0:+#;-#;0}", sellMusterBonus) : "";
+                Print("SELL Score:{0}/{1} (Buy:{2}) Kat:{3}/4{4} | HTF:{5}({6:F0}%) | RSI:{7:F0}{8} | ADX:{9:F0}{10} | EMA-Fan:{11:F2}% | TrendAge:{12} | Regime:{13} {14}",
+                    sellScore, sellMinScore, buyScore, sellKategorien, memStrS,
                     analyse.HtfTrend, analyse.HtfTrendStaerke * 100,
                     analyse.RsiWert, analyse.RsiFallend ? "↑" : (analyse.RsiSteigend ? "↓" : ""),
                     analyse.Trendstaerke, analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
@@ -1999,6 +2079,17 @@ namespace cAlgo.Robots
                 string typ = istPyramide ? "PYRAMIDE" : "NEU";
                 Print("{0} Trade: {1} {2:F0} Einheiten | SL:{3:F1} TP:{4:F1} Pips | Risiko:{5:F2}%",
                     typ, richtung, positionsGroesse, stopLossPips, takeProfitPips, riskPercent);
+
+                // v4.8: Muster-Erinnerung - speichere aktive Muster für diesen Trade
+                bool isBuy = analyse.Signal == SignalTyp.Buy;
+                var aktiveMuster = ExtrahiereMusterFuerErinnerung(analyse, isBuy);
+                var musterKombis = ErstelleMusterKombinationen(aktiveMuster);
+                long posId = result.Position.Id;
+                _tradeMuster[posId] = aktiveMuster;
+                _tradeMusterKombis[posId] = musterKombis;
+
+                if (aktiveMuster.Count > 0)
+                    Print("  Muster gespeichert: {0}", string.Join(", ", aktiveMuster.Where(m => !m.StartsWith("Regime:"))));
             }
         }
 
@@ -2515,7 +2606,9 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.7 gestoppt ===");
+            // v4.8: Abschlussbericht der Muster-Erinnerung
+            LoggeMusterErinnerung();
+            Print("=== FullAutoBot v4.8 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
@@ -2648,6 +2741,162 @@ namespace cAlgo.Robots
                 if (a.MomentumAusreichend) muster.Add("Mom✓");
             }
             return muster.Count > 0 ? "| " + string.Join(", ", muster) : "";
+        }
+
+        // v4.8: Extrahiere erkannte Muster als Liste für die Erinnerungsfunktion
+        // Enthält kontext-bewusste Tags (z.B. "BullEngulf@Support", "PinBar+Trend")
+        private List<string> ExtrahiereMusterFuerErinnerung(MarktAnalyse a, bool isBuy)
+        {
+            var muster = new List<string>();
+            string trendKontext = a.IstTrendStark ? "+StarkTrend" : "";
+            string srKontextBuy = a.PreisNahUnterstuetzung ? "@Support" : "";
+            string srKontextSell = a.PreisNahWiderstand ? "@Resist" : "";
+
+            if (isBuy)
+            {
+                // Kerzen-Muster mit Kontext
+                if (a.MorningStar) muster.Add("MorningStar" + srKontextBuy);
+                if (a.ThreeWhiteSoldiers) muster.Add("3WS" + trendKontext);
+                if (a.BullishInsideBarBreakout) muster.Add("InsideBreakout" + trendKontext);
+                if (a.BullishEngulfing) muster.Add("BullEngulf" + srKontextBuy);
+                if (a.BullishPinBar) muster.Add("PinBar" + srKontextBuy);
+                if (a.BullishTweezerBottom) muster.Add("TweezerBot" + srKontextBuy);
+                if (a.DojiAnUnterstuetzung) muster.Add("DojiSupport");
+                if (a.DoubleBottomErkannt) muster.Add("DoubleBottom");
+                // Struktur-Muster
+                if (a.RsiBullishDivergenz) muster.Add("RSI-BullDiv");
+                if (a.HigherHighs) muster.Add("HH/HL");
+                if (a.StrukturBruchBullish) muster.Add("BoS-Bull");
+                if (a.EmaPullbackBounceBuy) muster.Add("EMA-Pullback-Buy");
+                if (a.MacdBullishCross && a.MacdCrossFrisch) muster.Add("MACD-FreshCross-Bull");
+                // Regime-Kontext
+                if (a.BollingerSqueeze) muster.Add("BB-Squeeze");
+                if (a.VolumenUeberDurchschnitt && a.IstBullishKerze) muster.Add("Vol-Confirm-Buy");
+            }
+            else
+            {
+                if (a.EveningStar) muster.Add("EveningStar" + srKontextSell);
+                if (a.ThreeBlackCrows) muster.Add("3BC" + trendKontext);
+                if (a.BearishInsideBarBreakout) muster.Add("InsideBreakout" + trendKontext);
+                if (a.BearishEngulfing) muster.Add("BearEngulf" + srKontextSell);
+                if (a.BearishPinBar) muster.Add("PinBar" + srKontextSell);
+                if (a.BearishTweezerTop) muster.Add("TweezerTop" + srKontextSell);
+                if (a.DojiAnWiderstand) muster.Add("DojiResist");
+                if (a.DoubleTopErkannt) muster.Add("DoubleTop");
+                if (a.RsiBearishDivergenz) muster.Add("RSI-BearDiv");
+                if (a.LowerLows) muster.Add("LL/LH");
+                if (a.StrukturBruchBearish) muster.Add("BoS-Bear");
+                if (a.EmaPullbackBounceSell) muster.Add("EMA-Pullback-Sell");
+                if (a.MacdBearishCross && a.MacdCrossFrisch) muster.Add("MACD-FreshCross-Bear");
+                if (a.BollingerSqueeze) muster.Add("BB-Squeeze");
+                if (a.VolumenUeberDurchschnitt && a.IstBearishKerze) muster.Add("Vol-Confirm-Sell");
+            }
+
+            // Regime als globalen Kontext hinzufügen
+            muster.Add("Regime:" + a.Regime.ToString());
+
+            return muster;
+        }
+
+        // v4.8: Erstelle die wichtigsten 2er-Kombinationen für Kombinations-Erinnerung
+        private List<string> ErstelleMusterKombinationen(List<string> muster)
+        {
+            var kombis = new List<string>();
+            // Nur Kerzen/Struktur-Muster kombinieren (Regime ausschließen)
+            var relevanteMuster = muster.Where(m => !m.StartsWith("Regime:") && !m.StartsWith("Vol-")).ToList();
+
+            for (int i = 0; i < relevanteMuster.Count && i < 5; i++)
+            {
+                for (int j = i + 1; j < relevanteMuster.Count && j < 5; j++)
+                {
+                    // Alphabetisch sortiert damit "A+B" == "B+A"
+                    string a = relevanteMuster[i];
+                    string b = relevanteMuster[j];
+                    string kombi = string.Compare(a, b, StringComparison.Ordinal) < 0
+                        ? a + "+" + b : b + "+" + a;
+                    kombis.Add(kombi);
+                }
+            }
+            return kombis;
+        }
+
+        // v4.8: Berechne Muster-Erinnerungs-Bonus basierend auf historischen Win-Rates
+        private int BerechneMusterErinnerungsBonus(List<string> muster, List<string> kombis)
+        {
+            double bonus = 0;
+            int bewerteteMuster = 0;
+
+            // Einzelmuster bewerten
+            foreach (var m in muster)
+            {
+                if (m.StartsWith("Regime:")) continue; // Regime nicht einzeln bewerten
+                if (!_musterErinnerung.TryGetValue(m, out var stats)) continue;
+                if (stats.Total < 3) continue; // Zu wenig Daten
+
+                bewerteteMuster++;
+                double wr = stats.GewichteteWinRate;
+
+                if (wr >= 0.70) bonus += 1.5;       // Sehr profitables Muster
+                else if (wr >= 0.60) bonus += 0.5;   // Leicht profitabel
+                else if (wr <= 0.30) bonus -= 2.0;   // Verlustmuster = starke Warnung
+                else if (wr <= 0.40) bonus -= 1.0;   // Schwaches Muster
+            }
+
+            // Kombinationen bewerten (stärker gewichtet da spezifischer)
+            foreach (var k in kombis)
+            {
+                if (!_musterErinnerung.TryGetValue("K:" + k, out var stats)) continue;
+                if (stats.Total < 2) continue; // Kombinationen brauchen weniger Daten
+
+                double wr = stats.GewichteteWinRate;
+
+                if (wr >= 0.75) bonus += 2.0;       // Kombination historisch sehr stark
+                else if (wr >= 0.60) bonus += 1.0;   // Solide Kombination
+                else if (wr <= 0.25) bonus -= 2.5;   // Toxische Kombination
+                else if (wr <= 0.40) bonus -= 1.5;   // Schwache Kombination
+            }
+
+            // Cap auf [-4, +4] damit Erinnerung nicht alles dominiert
+            return (int)Math.Max(-4, Math.Min(4, Math.Round(bonus)));
+        }
+
+        // v4.8: Periodisches Logging der besten/schlechtesten Muster
+        private void LoggeMusterErinnerung()
+        {
+            if (_musterErinnerung.Count == 0) return;
+
+            var sortiert = _musterErinnerung
+                .Where(kvp => kvp.Value.Total >= 3 && !kvp.Key.StartsWith("K:"))
+                .OrderByDescending(kvp => kvp.Value.GewichteteWinRate)
+                .ToList();
+
+            if (sortiert.Count == 0) return;
+
+            Print("=== MUSTER-ERINNERUNG ({0} Muster getrackt) ===", _musterErinnerung.Count);
+
+            // Top 3 Muster
+            var top = sortiert.Take(3);
+            foreach (var m in top)
+                Print("  TOP: {0} WR:{1:F0}% ({2}W/{3}L) gwWR:{4:F0}%",
+                    m.Key, m.Value.WinRate * 100, m.Value.Gewinne, m.Value.Verluste,
+                    m.Value.GewichteteWinRate * 100);
+
+            // Bottom 3 Muster
+            var bottom = sortiert.TakeLast(3);
+            foreach (var m in bottom)
+                Print("  LOW: {0} WR:{1:F0}% ({2}W/{3}L) gwWR:{4:F0}%",
+                    m.Key, m.Value.WinRate * 100, m.Value.Gewinne, m.Value.Verluste,
+                    m.Value.GewichteteWinRate * 100);
+
+            // Top Kombinationen
+            var kombiSortiert = _musterErinnerung
+                .Where(kvp => kvp.Value.Total >= 2 && kvp.Key.StartsWith("K:"))
+                .OrderByDescending(kvp => kvp.Value.GewichteteWinRate)
+                .Take(3).ToList();
+            foreach (var k in kombiSortiert)
+                Print("  KOMBI: {0} WR:{1:F0}% ({2}T) gwWR:{3:F0}%",
+                    k.Key.Substring(2), k.Value.WinRate * 100, k.Value.Total,
+                    k.Value.GewichteteWinRate * 100);
         }
 
         private int TimeframeZuMinuten(TimeFrame tf)
@@ -2810,5 +3059,39 @@ namespace cAlgo.Robots
 
         // v4.2: Volatilitäts-Regime Enum
         private enum VolatilitaetsRegime { Niedrig, Normal, Hoch, Extrem }
+
+        // v4.8: Muster-Erinnerung Statistik-Klasse
+        private class MusterStatistik
+        {
+            public int Gewinne;
+            public int Verluste;
+            public int Total => Gewinne + Verluste;
+            public double WinRate => Total > 0 ? (double)Gewinne / Total : 0.5;
+
+            // Gewichtete Win-Rate: Neuere Trades zählen mehr (Decay-Faktor)
+            public double GewichteteGewinne;
+            public double GewichteteVerluste;
+            public double GewichteterTotal => GewichteteGewinne + GewichteteVerluste;
+            public double GewichteteWinRate => GewichteterTotal > 0.5
+                ? GewichteteGewinne / GewichteterTotal : 0.5;
+
+            public void AddErgebnis(bool gewinn)
+            {
+                // Decay: Alte Ergebnisse verlieren an Gewicht (Faktor 0.92 pro Trade)
+                GewichteteGewinne *= 0.92;
+                GewichteteVerluste *= 0.92;
+
+                if (gewinn)
+                {
+                    Gewinne++;
+                    GewichteteGewinne += 1.0;
+                }
+                else
+                {
+                    Verluste++;
+                    GewichteteVerluste += 1.0;
+                }
+            }
+        }
     }
 }
