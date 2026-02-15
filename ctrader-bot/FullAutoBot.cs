@@ -1,5 +1,5 @@
 // ============================================================================
-// FullAutoBot v4.6 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.7 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // 8 Parameter für volle Kontrolle - Symbol & Timeframe automatisch vom Chart.
 //
@@ -21,6 +21,22 @@
 //   Konservativ: Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5, max 1 Trade/Richtung
 //   Normal:      Standard-Werte (ausgewogen)
 //   Aggressiv:   Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5, max 3 Trades/Richtung
+//
+// v4.7 Signal-Qualität massiv verbessert:
+//   KONFLUENZ-SYSTEM:
+//   - 4 Signal-Kategorien: Trend, Momentum, PriceAction, Bestätigung
+//   - Mindestens 3 von 4 Kategorien müssen positiv sein (kein einseitiges Signal)
+//   - Jedes Signal wird geprüft ob es aus verschiedenen Quellen kommt
+//   NEUE SIGNAL-FAKTOREN:
+//   - RSI-Richtung: Steigender/Fallender RSI als Momentum-Signal (+1/-1)
+//   - EMA Fan-Out Stärke: Abstand Fast/Slow EMA als Trend-Qualität (>0.15%=+1, <0.03%=-1)
+//   - MACD-Cross Frische: Frischer Cross (<3 Bars) = +1, staler Cross = -1
+//   - Trend-Alter: Frischer Trend (3-15 Bars) = +2, alter Trend (>40) = -1
+//   HTF ROBUSTER:
+//   - HTF-Trend braucht 2-Bar-Bestätigung + EMA-Mindestabstand (0.05%)
+//   - HTF-Trend-Stärke als Bonus bei starkem Higher-Timeframe-Signal
+//   LOGGING:
+//   - Kategorie-Count (Kat:3/4), HTF-Stärke, RSI-Richtung, EMA-Fan-Out, Trend-Alter
 //
 // v4.6 Automatische Chart-Erkennung:
 //   - Symbol & Timeframe automatisch vom Chart erkannt (kein manuelles Setzen)
@@ -346,6 +362,11 @@ namespace cAlgo.Robots
         private double _ddStufe2Prozent;  // Ab wann Stufe 2 greift
         private double _ddStufe2Reduktion; // Risikoreduktion in Stufe 2
 
+        // v4.7: Trend-Alter Tracking
+        private int _trendAlterBars;
+        private TrendRichtung _letzteEmaRichtung;
+        private double _htfTrendStaerke; // 0-1, wie klar ist der HTF-Trend
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -354,7 +375,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.6 gestartet ===");
+            Print("=== FullAutoBot v4.7 gestartet ===");
             Print("Markt: {0} | Timeframe: {1} (automatisch vom Chart erkannt)",
                 Symbol.Name, TimeFrame);
 
@@ -401,6 +422,9 @@ namespace cAlgo.Robots
             _vorLetzterSwingHigh = 0;
             _vorLetzterSwingLow = double.MaxValue;
             _aktuellesVolRegime = VolatilitaetsRegime.Normal;
+            _trendAlterBars = 0;
+            _letzteEmaRichtung = TrendRichtung.Seitwaerts;
+            _htfTrendStaerke = 0;
 
             // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
@@ -854,6 +878,7 @@ namespace cAlgo.Robots
 
             // 1. Higher Timeframe Trend
             analyse.HtfTrend = ErmittleHTFTrend();
+            analyse.HtfTrendStaerke = _htfTrendStaerke;
 
             // 2. EMA Trend
             analyse.EmaSignal = ErmittleEmaTrend(index);
@@ -862,19 +887,43 @@ namespace cAlgo.Robots
             double close = _marktBars.ClosePrices.Last(1);
             analyse.UeberEma200 = close > _ema200.Result.Last(1);
 
+            // v4.7: EMA Fan-Out Stärke (Abstand Fast vs Slow als % vom Preis)
+            double emaFast = _emaFast.Result.Last(1);
+            double emaSlow = _emaSlow.Result.Last(1);
+            analyse.EmaFanOutStaerke = close > 0 ? Math.Abs(emaFast - emaSlow) / close * 100 : 0;
+
+            // v4.7: Trend-Alter tracken (Bars seit EMA-Richtung gewechselt hat)
+            TrendRichtung aktuelleRichtung = analyse.EmaSignal;
+            if (aktuelleRichtung == _letzteEmaRichtung && aktuelleRichtung != TrendRichtung.Seitwaerts)
+                _trendAlterBars++;
+            else
+            {
+                _trendAlterBars = 1;
+                _letzteEmaRichtung = aktuelleRichtung;
+            }
+            analyse.TrendAlter = _trendAlterBars;
+
             // 4. ADX Trendstärke + DI-Richtung
             analyse.Trendstaerke = _adx.ADX.Last(1);
             analyse.IstTrendStark = analyse.Trendstaerke > 20;
             analyse.DiPlus = _adx.DIPlus.Last(1);
             analyse.DiMinus = _adx.DIMinus.Last(1);
 
-            // 5. RSI mit Divergenz-Erkennung
+            // 5. RSI mit Divergenz-Erkennung + Richtung
             analyse.RsiWert = _rsi.Result.Last(1);
             analyse.RsiVorher = _rsi.Result.Last(2);
             analyse.RsiUeberkauft = analyse.RsiWert > 70;
             analyse.RsiUeberverkauft = analyse.RsiWert < 30;
             analyse.RsiBullishDivergenz = ErkenneRsiBullishDivergenz();
             analyse.RsiBearishDivergenz = ErkenneRsiBearishDivergenz();
+
+            // v4.7: RSI-Richtung über 3 Bars (steigt oder fällt RSI konsistent?)
+            if (_rsi.Result.Count >= 4)
+            {
+                double rsi3 = _rsi.Result.Last(3);
+                analyse.RsiSteigend = analyse.RsiWert > analyse.RsiVorher && analyse.RsiVorher > rsi3;
+                analyse.RsiFallend = analyse.RsiWert < analyse.RsiVorher && analyse.RsiVorher < rsi3;
+            }
 
             // 6. MACD mit Momentum-Stärke
             analyse.MacdHistogramm = _macd.Histogram.Last(1);
@@ -885,6 +934,20 @@ namespace cAlgo.Robots
             // Momentum nimmt zu?
             analyse.MacdMomentumSteigt = Math.Abs(analyse.MacdHistogramm) > Math.Abs(analyse.MacdHistogrammVorher)
                 && Math.Abs(analyse.MacdHistogrammVorher) > Math.Abs(analyse.MacdHistogrammVorVorher);
+
+            // v4.7: MACD-Cross Frische (Cross innerhalb letzter 3 Bars = frisch)
+            bool crossBar1 = (analyse.MacdHistogramm > 0 && analyse.MacdHistogrammVorher <= 0)
+                          || (analyse.MacdHistogramm < 0 && analyse.MacdHistogrammVorher >= 0);
+            bool crossBar2 = (analyse.MacdHistogrammVorher > 0 && analyse.MacdHistogrammVorVorher <= 0)
+                          || (analyse.MacdHistogrammVorher < 0 && analyse.MacdHistogrammVorVorher >= 0);
+            bool crossBar3 = false;
+            if (_macd.Histogram.Count >= 5)
+            {
+                double hist4 = _macd.Histogram.Last(4);
+                crossBar3 = (analyse.MacdHistogrammVorVorher > 0 && hist4 <= 0)
+                          || (analyse.MacdHistogrammVorVorher < 0 && hist4 >= 0);
+            }
+            analyse.MacdCrossFrisch = crossBar1 || crossBar2 || crossBar3;
 
             // 7. Bollinger Bands
             analyse.PreisNahOberemBand = close >= _bollingerBands.Top.Last(1) * 0.998;
@@ -1408,9 +1471,28 @@ namespace cAlgo.Robots
             double htfSlow = _htfEmaSlow.Result.Last(1);
             double htfClose = _higherTimeframeBars.ClosePrices.Last(1);
 
-            if (htfFast > htfSlow && htfClose > htfFast)
+            // v4.7: Robusterer HTF-Trend mit EMA-Abstand + Konsistenz
+            double htfAbstand = htfSlow > 0 ? Math.Abs(htfFast - htfSlow) / htfSlow * 100 : 0;
+
+            // EMAs müssen deutlich getrennt sein (>0.05% Abstand)
+            // + Close muss auf der richtigen Seite sein
+            // + Vorherige Bar muss gleiche Richtung bestätigen
+            double htfCloseVorher = _higherTimeframeBars.ClosePrices.Last(2);
+            double htfFastVorher = _htfEmaFast.Result.Last(2);
+            double htfSlowVorher = _htfEmaSlow.Result.Last(2);
+
+            bool aufwaerts = htfFast > htfSlow && htfClose > htfFast && htfAbstand > 0.05;
+            bool aufwaertsBestaetigt = htfFastVorher > htfSlowVorher && htfCloseVorher > htfSlowVorher;
+
+            bool abwaerts = htfFast < htfSlow && htfClose < htfFast && htfAbstand > 0.05;
+            bool abwaertsBestaetigt = htfFastVorher < htfSlowVorher && htfCloseVorher < htfSlowVorher;
+
+            // HTF-Trend-Stärke für Signalqualität (wird in analyse.HtfTrendStaerke genutzt)
+            _htfTrendStaerke = Math.Min(1.0, htfAbstand / 0.3); // 0.3% = volle Stärke
+
+            if (aufwaerts && aufwaertsBestaetigt)
                 return TrendRichtung.Aufwaerts;
-            if (htfFast < htfSlow && htfClose < htfFast)
+            if (abwaerts && abwaertsBestaetigt)
                 return TrendRichtung.Abwaerts;
             return TrendRichtung.Seitwaerts;
         }
@@ -1443,162 +1525,214 @@ namespace cAlgo.Robots
             int buyScore = 0;
             int sellScore = 0;
 
-            // --- GEWICHTETES BUY SCORING ---
+            // v4.7: Konfluenz-Kategorien tracken (Signal muss aus verschiedenen Quellen kommen)
+            int buyKatTrend = 0, buyKatMomentum = 0, buyKatPriceAction = 0, buyKatBestaetigung = 0;
+            int sellKatTrend = 0, sellKatMomentum = 0, sellKatPriceAction = 0, sellKatBestaetigung = 0;
+
+            // ================================================================
+            // KATEGORIE A: TREND (HTF, EMA, 200EMA, ADX-Richtung)
+            // ================================================================
 
             // Higher Timeframe Trend (Gewicht: 3)
-            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) buyScore += 3;
-            if (analyse.HtfTrend == TrendRichtung.Abwaerts) buyScore -= 3;
+            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) { buyScore += 3; buyKatTrend++; }
+            if (analyse.HtfTrend == TrendRichtung.Abwaerts) { buyScore -= 3; }
+            if (analyse.HtfTrend == TrendRichtung.Abwaerts) { sellScore += 3; sellKatTrend++; }
+            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) { sellScore -= 3; }
 
-            // 200 EMA Langfrist-Filter (Gewicht: 2)
-            if (analyse.UeberEma200) buyScore += 2;
-            else buyScore -= 1;
-
-            // EMA Trend (Gewicht: 2)
-            if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
-
-            // ADX + DI Richtung (Gewicht: 2-3, extra für starke Trends)
-            if (analyse.IstTrendStark && analyse.DiPlus > analyse.DiMinus)
+            // v4.7: HTF-Trend-Stärke als Multiplikator (starker HTF = zuverlässiger)
+            if (analyse.HtfTrendStaerke > 0.6)
             {
-                buyScore += 2;
-                if (analyse.Trendstaerke > 30) buyScore += 1; // Bonus für sehr starken Trend
+                if (analyse.HtfTrend == TrendRichtung.Aufwaerts) buyScore += 1;
+                if (analyse.HtfTrend == TrendRichtung.Abwaerts) sellScore += 1;
             }
 
-            // RSI Zone - ADAPTIV an Trend (im Aufwärtstrend: Pullbacks = Kaufchance)
+            // 200 EMA Langfrist-Filter (Gewicht: 2)
+            if (analyse.UeberEma200) { buyScore += 2; buyKatTrend++; }
+            else buyScore -= 1;
+            if (!analyse.UeberEma200) { sellScore += 2; sellKatTrend++; }
+            else sellScore -= 1;
+
+            // EMA Trend (Gewicht: 2)
+            if (analyse.EmaSignal == TrendRichtung.Aufwaerts) { buyScore += 2; buyKatTrend++; }
+            if (analyse.EmaSignal == TrendRichtung.Abwaerts) { sellScore += 2; sellKatTrend++; }
+
+            // v4.7: EMA Fan-Out Stärke (starker Abstand = zuverlässigerer Trend)
+            if (analyse.EmaFanOutStaerke > 0.15)
+            {
+                if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 1;
+                if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 1;
+            }
+            else if (analyse.EmaFanOutStaerke < 0.03)
+            {
+                // EMAs kaum getrennt = Trend unsicher
+                buyScore -= 1;
+                sellScore -= 1;
+            }
+
+            // ADX + DI Richtung (Gewicht: 2-3)
+            if (analyse.IstTrendStark && analyse.DiPlus > analyse.DiMinus)
+            {
+                buyScore += 2; buyKatTrend++;
+                if (analyse.Trendstaerke > 30) buyScore += 1;
+            }
+            if (analyse.IstTrendStark && analyse.DiMinus > analyse.DiPlus)
+            {
+                sellScore += 2; sellKatTrend++;
+                if (analyse.Trendstaerke > 30) sellScore += 1;
+            }
+
+            // v4.7: Trend-Alter Bonus (frischer Trend 3-15 Bars = beste Phase)
+            if (analyse.TrendAlter >= 3 && analyse.TrendAlter <= 15)
+            {
+                if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
+                if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
+            }
+            else if (analyse.TrendAlter > 40)
+            {
+                // Alter Trend = Erschöpfung wahrscheinlicher
+                if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore -= 1;
+                if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore -= 1;
+            }
+
+            // ================================================================
+            // KATEGORIE B: MOMENTUM (RSI, MACD, ADX-Dynamik)
+            // ================================================================
+
+            // RSI Zone - ADAPTIV an Trend
             double buyOversold = analyse.EmaSignal == TrendRichtung.Aufwaerts ? 40 : 30;
             double buyOverbought = analyse.EmaSignal == TrendRichtung.Aufwaerts ? 80 : 70;
-            if (analyse.RsiWert < buyOversold) buyScore += 2;
+            if (analyse.RsiWert < buyOversold) { buyScore += 2; buyKatMomentum++; }
             else if (analyse.RsiWert < 50 && analyse.RsiWert > buyOversold) buyScore += 1;
             if (analyse.RsiWert > buyOverbought) buyScore -= 3;
 
-            // RSI Divergenz (Gewicht: 3 - stark!)
-            if (analyse.RsiBullishDivergenz) buyScore += 3;
+            double sellOverbought = analyse.EmaSignal == TrendRichtung.Abwaerts ? 60 : 70;
+            double sellOversold = analyse.EmaSignal == TrendRichtung.Abwaerts ? 20 : 30;
+            if (analyse.RsiWert > sellOverbought) { sellScore += 2; sellKatMomentum++; }
+            else if (analyse.RsiWert > 50 && analyse.RsiWert < sellOverbought) sellScore += 1;
+            if (analyse.RsiWert < sellOversold) sellScore -= 3;
+
+            // v4.7: RSI-Richtung (steigender RSI = bullisch, fallender = bearisch)
+            if (analyse.RsiSteigend) { buyScore += 1; buyKatMomentum++; }
+            if (analyse.RsiFallend) { sellScore += 1; sellKatMomentum++; }
+            // Gegen-Richtung: RSI fällt aber wir wollen kaufen
+            if (analyse.RsiFallend && analyse.RsiWert < 45) buyScore -= 1;
+            if (analyse.RsiSteigend && analyse.RsiWert > 55) sellScore -= 1;
+
+            // RSI Divergenz (Gewicht: 3)
+            if (analyse.RsiBullishDivergenz) { buyScore += 3; buyKatMomentum++; }
+            if (analyse.RsiBearishDivergenz) { sellScore += 3; sellKatMomentum++; }
 
             // MACD (Gewicht: 2)
-            if (analyse.MacdBullishCross) buyScore += 2;
+            if (analyse.MacdBullishCross) { buyScore += 2; buyKatMomentum++; }
+            if (analyse.MacdBearishCross) { sellScore += 2; sellKatMomentum++; }
             if (analyse.MacdHistogramm > 0 && analyse.MacdMomentumSteigt) buyScore += 1;
+            if (analyse.MacdHistogramm < 0 && analyse.MacdMomentumSteigt) sellScore += 1;
 
-            // Bollinger (Gewicht: 1-2)
-            if (analyse.PreisNahUnteremBand) buyScore += 1;
-            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
+            // v4.7: MACD-Cross Frische (frischer Cross = stärkeres Signal)
+            if (analyse.MacdCrossFrisch)
+            {
+                if (analyse.MacdHistogramm > 0) buyScore += 1;
+                if (analyse.MacdHistogramm < 0) sellScore += 1;
+            }
+            else
+            {
+                // Staler MACD: Cross ist >3 Bars alt → weniger vertrauenswürdig
+                if (analyse.MacdBullishCross) buyScore -= 1; // Abzug für altes Cross-Signal
+                if (analyse.MacdBearishCross) sellScore -= 1;
+            }
 
-            // Kerzenformationen Basis (Gewicht: 2-3)
-            if (analyse.BullishEngulfing) buyScore += 3;
-            if (analyse.BullishPinBar) buyScore += 2;
-            if (analyse.StarkeMomentumKerze && analyse.IstBullishKerze) buyScore += 2;
+            // ADX-Dynamik (steigend = Trend verstärkt sich)
+            if (analyse.AdxSteigend && analyse.IstTrendStark) { buyScore += 2; sellScore += 2; buyKatMomentum++; sellKatMomentum++; }
+            if (analyse.AdxFallend && analyse.Trendstaerke > 25) { buyScore -= 1; sellScore -= 1; }
+
+            // Momentum-Filter
+            if (analyse.MomentumAusreichend)
+            {
+                buyScore += 1; sellScore += 1;
+            }
+            else
+            {
+                buyScore -= 2; sellScore -= 2;
+            }
+
+            // ================================================================
+            // KATEGORIE C: PRICE ACTION (Kerzen, S/R, Muster, Bollinger)
+            // ================================================================
+
+            // Bollinger
+            if (analyse.PreisNahUnteremBand) { buyScore += 1; buyKatPriceAction++; }
+            if (analyse.PreisNahOberemBand) { sellScore += 1; sellKatPriceAction++; }
+            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Aufwaerts) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Abwaerts) { sellScore += 2; sellKatPriceAction++; }
+
+            // Kerzenformationen Basis
+            if (analyse.BullishEngulfing) { buyScore += 3; buyKatPriceAction++; }
+            if (analyse.BullishPinBar) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.StarkeMomentumKerze && analyse.IstBullishKerze) { buyScore += 2; buyKatPriceAction++; }
             else if (analyse.IstBullishKerze && analyse.KerzenKoerper > analyse.UntererDocht) buyScore += 1;
 
-            // Erweiterte Kerzenmuster (v4.5, Gewicht: 2-3+1 Kontext-Bonus)
-            if (analyse.MorningStar)                                  // Starkes Umkehrmuster
-            { buyScore += 3; if (analyse.PreisNahUnterstuetzung) buyScore += 1; }
-            if (analyse.ThreeWhiteSoldiers)                           // Starke Continuation
-            { buyScore += 2; if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 1; }
-            if (analyse.BullishInsideBarBreakout) buyScore += 2;      // Breakout-Signal
-            if (analyse.DojiAnUnterstuetzung) buyScore += 2;          // Unsicherheit am Support
-            if (analyse.BullishTweezerBottom) buyScore += 2;          // Doppelboden-Kerze
+            if (analyse.BearishEngulfing) { sellScore += 3; sellKatPriceAction++; }
+            if (analyse.BearishPinBar) { sellScore += 2; sellKatPriceAction++; }
+            if (analyse.StarkeMomentumKerze && analyse.IstBearishKerze) { sellScore += 2; sellKatPriceAction++; }
+            else if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
 
-            // Chart-Muster (v4, Gewicht: 3)
-            if (analyse.DoubleBottomErkannt) buyScore += 3;           // Double Bottom Breakout
+            // Erweiterte Kerzenmuster
+            if (analyse.MorningStar)
+            { buyScore += 3; buyKatPriceAction++; if (analyse.PreisNahUnterstuetzung) buyScore += 1; }
+            if (analyse.ThreeWhiteSoldiers)
+            { buyScore += 2; buyKatPriceAction++; if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 1; }
+            if (analyse.BullishInsideBarBreakout) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.DojiAnUnterstuetzung) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.BullishTweezerBottom) { buyScore += 2; buyKatPriceAction++; }
 
-            // Support/Resistance (v4, Gewicht: 1-2)
-            if (analyse.PreisNahUnterstuetzung) buyScore += 2;        // Bounce am Support
-            if (analyse.PreisNahWiderstand) buyScore -= 1;            // Nahe am Widerstand = Risiko
+            if (analyse.EveningStar)
+            { sellScore += 3; sellKatPriceAction++; if (analyse.PreisNahWiderstand) sellScore += 1; }
+            if (analyse.ThreeBlackCrows)
+            { sellScore += 2; sellKatPriceAction++; if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 1; }
+            if (analyse.BearishInsideBarBreakout) { sellScore += 2; sellKatPriceAction++; }
+            if (analyse.DojiAnWiderstand) { sellScore += 2; sellKatPriceAction++; }
+            if (analyse.BearishTweezerTop) { sellScore += 2; sellKatPriceAction++; }
 
-            // ADX-Dynamik (v4, Gewicht: 1-2)
-            if (analyse.AdxSteigend && analyse.IstTrendStark) buyScore += 2;  // Trend verstärkt sich
-            if (analyse.AdxFallend && analyse.Trendstaerke > 25) buyScore -= 1; // Trend schwächt ab
+            // Chart-Muster
+            if (analyse.DoubleBottomErkannt) { buyScore += 3; buyKatPriceAction++; }
+            if (analyse.DoubleTopErkannt) { sellScore += 3; sellKatPriceAction++; }
+
+            // Support/Resistance
+            if (analyse.PreisNahUnterstuetzung) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.PreisNahWiderstand) buyScore -= 1;
+            if (analyse.PreisNahWiderstand) { sellScore += 2; sellKatPriceAction++; }
+            if (analyse.PreisNahUnterstuetzung) sellScore -= 1;
+
+            // EMA-Pullback-Bounce
+            if (analyse.EmaPullbackBounceBuy) { buyScore += 2; buyKatPriceAction++; }
+            if (analyse.EmaPullbackBounceSell) { sellScore += 2; sellKatPriceAction++; }
 
             // Regime-Bonus
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Aufwaerts)
                 buyScore += 1;
-
-            // 3-Bar Momentum Konsistenz (Gewicht: 1)
-            if (analyse.DreiBarsAufwaerts) buyScore += 1;
-
-            // Close im oberen Drittel der Bar = bullische Überzeugung (Gewicht: 1)
-            if (analyse.CloseImOberenDrittel) buyScore += 1;
-
-            // EMA-Pullback-Bounce = qualitativ hochwertiger Einstieg (Gewicht: 2)
-            if (analyse.EmaPullbackBounceBuy) buyScore += 2;
-
-            // ATR expandiert = Markt bestätigt Bewegung (Gewicht: 1)
-            if (analyse.AtrExpandiert) buyScore += 1;
-
-            // Volle Konfluenz = alle Zeitebenen einig (Gewicht: 2 - stark!)
-            if (analyse.VolleKonfluenzBuy) buyScore += 2;
-
-            // --- GEWICHTETES SELL SCORING ---
-
-            if (analyse.HtfTrend == TrendRichtung.Abwaerts) sellScore += 3;
-            if (analyse.HtfTrend == TrendRichtung.Aufwaerts) sellScore -= 3;
-
-            if (!analyse.UeberEma200) sellScore += 2;
-            else sellScore -= 1;
-
-            if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
-
-            if (analyse.IstTrendStark && analyse.DiMinus > analyse.DiPlus)
-            {
-                sellScore += 2;
-                if (analyse.Trendstaerke > 30) sellScore += 1;
-            }
-
-            // RSI adaptiv für Sell (im Abwärtstrend: Bounces = Verkaufschance)
-            double sellOverbought = analyse.EmaSignal == TrendRichtung.Abwaerts ? 60 : 70;
-            double sellOversold = analyse.EmaSignal == TrendRichtung.Abwaerts ? 20 : 30;
-            if (analyse.RsiWert > sellOverbought) sellScore += 2;
-            else if (analyse.RsiWert > 50 && analyse.RsiWert < sellOverbought) sellScore += 1;
-            if (analyse.RsiWert < sellOversold) sellScore -= 3;
-
-            if (analyse.RsiBearishDivergenz) sellScore += 3;
-
-            if (analyse.MacdBearishCross) sellScore += 2;
-            if (analyse.MacdHistogramm < 0 && analyse.MacdMomentumSteigt) sellScore += 1;
-
-            if (analyse.PreisNahOberemBand) sellScore += 1;
-            if (analyse.BollingerSqueeze && analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
-
-            if (analyse.BearishEngulfing) sellScore += 3;
-            if (analyse.BearishPinBar) sellScore += 2;
-            if (analyse.StarkeMomentumKerze && analyse.IstBearishKerze) sellScore += 2;
-            else if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
-
-            // Erweiterte Kerzenmuster Sell (v4.5, Gewicht: 2-3+1 Kontext-Bonus)
-            if (analyse.EveningStar)
-            { sellScore += 3; if (analyse.PreisNahWiderstand) sellScore += 1; }
-            if (analyse.ThreeBlackCrows)
-            { sellScore += 2; if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 1; }
-            if (analyse.BearishInsideBarBreakout) sellScore += 2;
-            if (analyse.DojiAnWiderstand) sellScore += 2;
-            if (analyse.BearishTweezerTop) sellScore += 2;
-
-            // Chart-Muster Sell (v4, Gewicht: 3)
-            if (analyse.DoubleTopErkannt) sellScore += 3;
-
-            // S/R Sell (v4)
-            if (analyse.PreisNahWiderstand) sellScore += 2;
-            if (analyse.PreisNahUnterstuetzung) sellScore -= 1;
-
-            // ADX-Dynamik Sell (v4)
-            if (analyse.AdxSteigend && analyse.IstTrendStark) sellScore += 2;
-            if (analyse.AdxFallend && analyse.Trendstaerke > 25) sellScore -= 1;
-
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Abwaerts)
                 sellScore += 1;
 
+            // Kleinere Signale (kein eigenes Kategorie-Tag)
+            if (analyse.DreiBarsAufwaerts) buyScore += 1;
             if (analyse.DreiBarsAbwaerts) sellScore += 1;
+            if (analyse.CloseImOberenDrittel) buyScore += 1;
             if (analyse.CloseImUnterenDrittel) sellScore += 1;
-            if (analyse.EmaPullbackBounceSell) sellScore += 2;
-            if (analyse.AtrExpandiert) sellScore += 1;
+            if (analyse.AtrExpandiert) { buyScore += 1; sellScore += 1; }
+
+            // Volle Konfluenz
+            if (analyse.VolleKonfluenzBuy) buyScore += 2;
             if (analyse.VolleKonfluenzSell) sellScore += 2;
 
-            // === v4.2: NEUE SCORING-PARAMETER ===
+            // ================================================================
+            // KATEGORIE D: BESTÄTIGUNG (Volumen, Marktstruktur, BoS, Markt-Q)
+            // ================================================================
 
-            // Volumen-Bestätigung (Gewicht: 2) - NUR in Bar-Richtung (bullish → buy, bearish → sell)
+            // Volumen-Bestätigung - NUR in Bar-Richtung
             if (analyse.VolumenUeberDurchschnitt)
             {
-                if (analyse.IstBullishKerze) buyScore += 2;
-                if (analyse.IstBearishKerze) sellScore += 2;
-                // Extra-Bonus bei starkem Volumen (>1.5x)
+                if (analyse.IstBullishKerze) { buyScore += 2; buyKatBestaetigung++; }
+                if (analyse.IstBearishKerze) { sellScore += 2; sellKatBestaetigung++; }
                 if (analyse.VolumenRatio >= 1.5)
                 {
                     if (analyse.IstBullishKerze) buyScore += 1;
@@ -1607,70 +1741,35 @@ namespace cAlgo.Robots
             }
             else if (analyse.VolumenRatio < 0.7 && analyse.VolumenRatio > 0)
             {
-                // Schwaches Volumen = wenig Überzeugung
-                buyScore -= 1;
-                sellScore -= 1;
+                buyScore -= 1; sellScore -= 1;
             }
 
-            // Marktstruktur (Gewicht: 2-3) - HH/HL oder LL/LH bestätigt Trendrichtung
-            if (analyse.HigherHighs) buyScore += 2;    // Aufwärtsstruktur intakt
-            if (analyse.LowerLows) sellScore += 2;     // Abwärtsstruktur intakt
-            if (analyse.HigherHighs) sellScore -= 1;   // Gegen Aufwärtsstruktur = Risiko
-            if (analyse.LowerLows) buyScore -= 1;      // Gegen Abwärtsstruktur = Risiko
+            // Marktstruktur
+            if (analyse.HigherHighs) { buyScore += 2; buyKatBestaetigung++; }
+            if (analyse.LowerLows) { sellScore += 2; sellKatBestaetigung++; }
+            if (analyse.HigherHighs) sellScore -= 1;
+            if (analyse.LowerLows) buyScore -= 1;
 
-            // Break of Structure (Gewicht: 3) - Strukturbruch = starkes Signal
-            if (analyse.StrukturBruchBullish) buyScore += 3;
-            if (analyse.StrukturBruchBearish) sellScore += 3;
+            // Break of Structure
+            if (analyse.StrukturBruchBullish) { buyScore += 3; buyKatBestaetigung++; }
+            if (analyse.StrukturBruchBearish) { sellScore += 3; sellKatBestaetigung++; }
 
-            // Momentum-Filter (Gewicht: 1-2) - Mindest-Momentum als Qualitätsfilter
-            if (analyse.MomentumAusreichend)
-            {
-                buyScore += 1;
-                sellScore += 1;
-            }
-            else
-            {
-                // Kein Momentum = Signal ist schwach
-                buyScore -= 2;
-                sellScore -= 2;
-            }
+            // Volatilitäts-Regime
+            if (analyse.VolRegime == VolatilitaetsRegime.Hoch) { buyScore += 1; sellScore += 1; }
+            else if (analyse.VolRegime == VolatilitaetsRegime.Niedrig) { buyScore -= 1; sellScore -= 1; }
 
-            // Volatilitäts-Regime Bonus/Malus (Gewicht: 1)
-            if (analyse.VolRegime == VolatilitaetsRegime.Hoch)
-            {
-                // Hohe Vol = größere Moves möglich aber auch riskanter
-                buyScore += 1;
-                sellScore += 1;
-            }
-            else if (analyse.VolRegime == VolatilitaetsRegime.Niedrig)
-            {
-                // Niedrige Vol = wenig Bewegung erwartet
-                buyScore -= 1;
-                sellScore -= 1;
-            }
+            // Markt-Qualität
+            if (_marktQualitaet >= 0.9) { buyScore += 2; sellScore += 2; buyKatBestaetigung++; sellKatBestaetigung++; }
+            else if (_marktQualitaet >= 0.75) { buyScore += 1; sellScore += 1; }
 
-            // --- MARKT-QUALITÄTS-BONUS (v4.4: basiert auf Spread + Vol statt Uhrzeit) ---
-            if (_marktQualitaet >= 0.9)
-            {
-                buyScore += 2;  // Niedriger Spread, gute Vol: +2
-                sellScore += 2;
-            }
-            else if (_marktQualitaet >= 0.75)
-            {
-                buyScore += 1;  // Normaler Spread: +1
-                sellScore += 1;
-            }
-            // Unter 0.75: Kein Bonus (erhöhter Spread oder extreme Vol)
-
-            // --- RICHTUNGS-BIAS: Lernt aus letzten Ergebnissen ---
-            // Wenn Buys in letzter Zeit gut laufen -> Buy-Bonus
+            // Richtungs-Bias
             int recentBuyTotal = _recentBuyWins + _recentBuyLosses;
             int recentSellTotal = _recentSellWins + _recentSellLosses;
             if (recentBuyTotal >= 3)
             {
                 double buyWR = (double)_recentBuyWins / recentBuyTotal;
-                if (buyWR >= 0.7) buyScore += 1;      // Buys laufen gut
-                else if (buyWR <= 0.3) buyScore -= 1;  // Buys versagen
+                if (buyWR >= 0.7) buyScore += 1;
+                else if (buyWR <= 0.3) buyScore -= 1;
             }
             if (recentSellTotal >= 3)
             {
@@ -1679,56 +1778,60 @@ namespace cAlgo.Robots
                 else if (sellWR <= 0.3) sellScore -= 1;
             }
 
-            // --- VOLATILITÄTS-EXPANSION-BONUS ---
-            // Expandierende Volatilität = Markt bewegt sich = bessere Trade-Chance
-            if (_volatilitaetsRatio > 1.3)
-            {
-                buyScore += 1;
-                sellScore += 1;
-            }
+            // Vol-Expansion
+            if (_volatilitaetsRatio > 1.3) { buyScore += 1; sellScore += 1; }
 
-            // --- ENTSCHEIDUNG ---
-            // v3: Flexibler HTF-Filter + Squeeze-Breakout in Konsolidierung
+            // ================================================================
+            // v4.7: KONFLUENZ-KATEGORIEN ZÄHLEN
+            // Signal muss aus mindestens 3 verschiedenen Quellen kommen
+            // ================================================================
 
-            // Regime-adaptive Schwellenwerte (v4.1: deutlich höher - nur A+ Setups)
+            int buyKategorien = (buyKatTrend > 0 ? 1 : 0) + (buyKatMomentum > 0 ? 1 : 0)
+                + (buyKatPriceAction > 0 ? 1 : 0) + (buyKatBestaetigung > 0 ? 1 : 0);
+            int sellKategorien = (sellKatTrend > 0 ? 1 : 0) + (sellKatMomentum > 0 ? 1 : 0)
+                + (sellKatPriceAction > 0 ? 1 : 0) + (sellKatBestaetigung > 0 ? 1 : 0);
+
+            analyse.KonfluenzKategorien = Math.Max(buyKategorien, sellKategorien);
+
+            // ================================================================
+            // ENTSCHEIDUNG
+            // ================================================================
+
+            // Regime-adaptive Schwellenwerte
             int minScore;
             switch (analyse.Regime)
             {
-                case MarktRegime.StarkerTrend: minScore = 9; break;   // vorher 7
-                case MarktRegime.MittlererTrend: minScore = 10; break; // vorher 7
+                case MarktRegime.StarkerTrend: minScore = 9; break;
+                case MarktRegime.MittlererTrend: minScore = 10; break;
                 case MarktRegime.Konsolidierung:
-                    // Konsolidierung: NUR Bollinger-Squeeze-Breakouts erlaubt
                     if (!analyse.BollingerSqueeze)
                         return;
-                    minScore = 12; // vorher 9 - Nur absolute Ausnahme-Setups
+                    minScore = 12;
                     break;
-                default: minScore = 11; break; // SchwacherTrend (vorher 8)
+                default: minScore = 11; break;
             }
 
-            // Strategie-Modus Offset: Konservativ +2, Normal +0, Aggressiv -1
+            // Strategie-Modus Offset
             minScore = Math.Max(5, minScore + _strategieScoreOffset);
 
-            // ADX darf nicht fallend sein (Trend schwächt sich ab = schlechter Einstieg)
+            // ADX fallend = schlechter Einstieg
             if (analyse.AdxFallend && analyse.Regime != MarktRegime.Konsolidierung)
-            {
-                minScore += 2; // Noch strengere Anforderung wenn Trend nachlässt
-            }
+                minScore += 2;
 
-            // HTF-Filter: Flexibel statt binärer Block
-            // Mit HTF: +0 | Seitwärts: +1 | Gegen HTF: gesperrt
+            // HTF-Filter
             int htfBuyAufschlag = 0;
             int htfSellAufschlag = 0;
 
             if (analyse.HtfTrend == TrendRichtung.Seitwaerts)
             {
-                htfBuyAufschlag = 2; // vorher 1 - ohne klaren HTF-Trend viel schwieriger
+                htfBuyAufschlag = 2;
                 htfSellAufschlag = 2;
             }
             else if (analyse.HtfTrend == TrendRichtung.Aufwaerts)
             {
                 htfSellAufschlag = 99; // Sell gegen HTF = gesperrt
             }
-            else // Abwaerts
+            else
             {
                 htfBuyAufschlag = 99; // Buy gegen HTF = gesperrt
             }
@@ -1736,25 +1839,36 @@ namespace cAlgo.Robots
             int buyMinScore = minScore + htfBuyAufschlag;
             int sellMinScore = minScore + htfSellAufschlag;
 
-            // Score-Differenz: Richtung muss absolut klar sein (v4.1: diff 4)
-            if (buyScore >= buyMinScore && buyScore > sellScore + 4)
+            // v4.7: KONFLUENZ-GATE - Mindestens 3 Kategorien müssen positiv sein
+            // Verhindert Trades die nur auf einer einzigen Signal-Quelle basieren
+            bool buyKonfluenzOk = buyKategorien >= 3;
+            bool sellKonfluenzOk = sellKategorien >= 3;
+
+            // Score-Differenz: Richtung muss klar sein (diff 4)
+            if (buyScore >= buyMinScore && buyScore > sellScore + 4 && buyKonfluenzOk)
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
                 string muster = ErkanntesMusterString(analyse, true);
-                Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0}{6} | Regime:{7} {8}",
-                    buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke,
-                    analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                Print("BUY Score:{0}/{1} (Sell:{2}) Kat:{3}/4 | HTF:{4}({5:F0}%) | RSI:{6:F0}{7} | ADX:{8:F0}{9} | EMA-Fan:{10:F2}% | TrendAge:{11} | Regime:{12} {13}",
+                    buyScore, buyMinScore, sellScore, buyKategorien,
+                    analyse.HtfTrend, analyse.HtfTrendStaerke * 100,
+                    analyse.RsiWert, analyse.RsiSteigend ? "↑" : (analyse.RsiFallend ? "↓" : ""),
+                    analyse.Trendstaerke, analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                    analyse.EmaFanOutStaerke, analyse.TrendAlter,
                     analyse.Regime, muster);
             }
-            else if (sellScore >= sellMinScore && sellScore > buyScore + 4)
+            else if (sellScore >= sellMinScore && sellScore > buyScore + 4 && sellKonfluenzOk)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
                 string musterSell = ErkanntesMusterString(analyse, false);
-                Print("SELL Score:{0}/{1} (Buy:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0}{6} | Regime:{7} {8}",
-                    sellScore, sellMinScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke,
-                    analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                Print("SELL Score:{0}/{1} (Buy:{2}) Kat:{3}/4 | HTF:{4}({5:F0}%) | RSI:{6:F0}{7} | ADX:{8:F0}{9} | EMA-Fan:{10:F2}% | TrendAge:{11} | Regime:{12} {13}",
+                    sellScore, sellMinScore, buyScore, sellKategorien,
+                    analyse.HtfTrend, analyse.HtfTrendStaerke * 100,
+                    analyse.RsiWert, analyse.RsiFallend ? "↑" : (analyse.RsiSteigend ? "↓" : ""),
+                    analyse.Trendstaerke, analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
+                    analyse.EmaFanOutStaerke, analyse.TrendAlter,
                     analyse.Regime, musterSell);
             }
         }
@@ -2401,7 +2515,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.6 gestoppt ===");
+            Print("=== FullAutoBot v4.7 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
@@ -2683,6 +2797,15 @@ namespace cAlgo.Robots
             // v4.2: Momentum-Stärke
             public double MomentumStaerke { get; set; } // Wie stark ist die Bewegung (0-100)
             public bool MomentumAusreichend { get; set; }
+
+            // v4.7: Erweiterte Signal-Qualität
+            public bool RsiSteigend { get; set; }        // RSI steigt über 3 Bars
+            public bool RsiFallend { get; set; }          // RSI fällt über 3 Bars
+            public double EmaFanOutStaerke { get; set; }  // % Abstand Fast vs Slow EMA
+            public bool MacdCrossFrisch { get; set; }     // MACD-Cross innerhalb letzter 3 Bars
+            public int TrendAlter { get; set; }            // Bars seit EMA-Ausrichtung begann
+            public int KonfluenzKategorien { get; set; }   // Anzahl positiver Signal-Kategorien
+            public double HtfTrendStaerke { get; set; }    // 0-1, wie klar ist der HTF-Trend
         }
 
         // v4.2: Volatilitäts-Regime Enum
