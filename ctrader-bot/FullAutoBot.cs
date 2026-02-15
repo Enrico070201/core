@@ -1,8 +1,26 @@
 // ============================================================================
-// FullAutoBot v4.0 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.1 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
 // Alles andere wird automatisch berechnet und angepasst.
+//
+// v4.1 Signalqualität + Haltedauer:
+//   - minScore massiv erhöht: StarkerTrend 9, MittlererTrend 10, SchwacherTrend 11, Konso 12
+//   - Score-Differenz 4 (vorher 3): Richtung muss absolut eindeutig sein
+//   - ADX-Fallend-Filter: +2 auf minScore wenn Trend nachlässt
+//   - HTF Seitwärts Aufschlag: +2 statt +1
+//   - Cooldown minimum 3 Bars (Scalping 4)
+//   - Break-Even erst bei 2.5R (vorher 1.5R)
+//   - Partial #1: 30% bei 3.5R (vorher 40% bei 2.5R)
+//   - Partial #2: 40% bei 6R (vorher 50% bei 4R)
+//   - Trailing Start bei 3R (vorher 2R), Faktor 1.2 statt 1.0
+//   - Trailing im StarkerTrend: 1.5x Raum (vorher 1.3x)
+//   - Early-Exit fast deaktiviert: Nur noch bei 4+ Gegen-Signalen inkl. ADX
+//   - Reversal-Exit: 3 Signale nötig (vorher 2), höhere Mindestgewinne
+//   - Stale-Trade: Im Trend 1.5x mehr Geduld, alle Werte deutlich erhöht
+//   - TP-Multiplier: StarkerTrend 2.2x, MittlererTrend 1.6x, A+ 2.0x
+//   - Min R:R: 2.0:1 (vorher 1.8:1)
+//   - TP-Basis erhöht: Intraday 4.5, Swing 5.0, Positions 6.5 ATR
 //
 // v4.0 Mustererkennung & Profitabilitäts-Upgrade:
 //   - Morning Star / Evening Star (3-Kerzen Umkehr, Gewicht 4)
@@ -200,7 +218,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.0 gestartet ===");
+            Print("=== FullAutoBot v4.1 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -244,7 +262,7 @@ namespace cAlgo.Robots
             _dailyProfitPercent = 0;
             _dailyTradeCount = 0;
             _sessionQualitaet = 1.0;
-            _minRiskReward = 1.8; // Mindestens 1.8:1 R:R sonst kein Trade
+            _minRiskReward = 2.0; // Mindestens 2:1 R:R sonst kein Trade (vorher 1.8)
 
             // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
@@ -270,7 +288,7 @@ namespace cAlgo.Robots
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
                 _atrMultiplierSL = 1.5; _atrMultiplierTP = 3.0; _trailingAtrMultiplier = 1.0;
                 _baseRiskPercent = 0.8; _maxDrawdownPercent = 6.0;
-                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
+                _maxOpenPositions = 2; _signalCooldown = 4; _staleTradeBarCount = 50;
                 _dailyLossLimitPercent = 2.0;
             }
             else if (tfMinuten <= 30)
@@ -279,9 +297,9 @@ namespace cAlgo.Robots
                 _emaFastPeriod = 10; _emaMediumPeriod = 25; _emaSlowPeriod = 50;
                 _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 1.8; _atrMultiplierTP = 3.8; _trailingAtrMultiplier = 1.2;
+                _atrMultiplierSL = 1.8; _atrMultiplierTP = 4.5; _trailingAtrMultiplier = 1.5;
                 _baseRiskPercent = 1.2; _maxDrawdownPercent = 8.0;
-                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 25;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 40;
                 _dailyLossLimitPercent = 2.5;
             }
             else if (tfMinuten <= 240)
@@ -290,9 +308,9 @@ namespace cAlgo.Robots
                 _emaFastPeriod = 12; _emaMediumPeriod = 26; _emaSlowPeriod = 50;
                 _rsiPeriod = 14; _atrPeriod = 14; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 2.0; _atrMultiplierTP = 4.2; _trailingAtrMultiplier = 1.5;
+                _atrMultiplierSL = 2.0; _atrMultiplierTP = 5.0; _trailingAtrMultiplier = 2.0;
                 _baseRiskPercent = 1.6; _maxDrawdownPercent = 10.0;
-                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 18;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
                 _dailyLossLimitPercent = 3.0;
             }
             else
@@ -301,9 +319,9 @@ namespace cAlgo.Robots
                 _emaFastPeriod = 10; _emaMediumPeriod = 21; _emaSlowPeriod = 50;
                 _rsiPeriod = 14; _atrPeriod = 20; _adxPeriod = 14;
                 _bollingerPeriod = 20; _bollingerStdDev = 2.0;
-                _atrMultiplierSL = 2.5; _atrMultiplierTP = 5.5; _trailingAtrMultiplier = 2.0;
+                _atrMultiplierSL = 2.5; _atrMultiplierTP = 6.5; _trailingAtrMultiplier = 2.5;
                 _baseRiskPercent = 2.2; _maxDrawdownPercent = 12.0;
-                _maxOpenPositions = 2; _signalCooldown = 2; _staleTradeBarCount = 14;
+                _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 25;
                 _dailyLossLimitPercent = 3.5;
             }
         }
@@ -1230,19 +1248,25 @@ namespace cAlgo.Robots
             // --- ENTSCHEIDUNG ---
             // v3: Flexibler HTF-Filter + Squeeze-Breakout in Konsolidierung
 
-            // Regime-adaptive Schwellenwerte (v3.2: +1 überall - weniger Trades, bessere Qualität)
+            // Regime-adaptive Schwellenwerte (v4.1: deutlich höher - nur A+ Setups)
             int minScore;
             switch (analyse.Regime)
             {
-                case MarktRegime.StarkerTrend: minScore = 7; break;   // vorher 6
-                case MarktRegime.MittlererTrend: minScore = 7; break;  // vorher 6
+                case MarktRegime.StarkerTrend: minScore = 9; break;   // vorher 7
+                case MarktRegime.MittlererTrend: minScore = 10; break; // vorher 7
                 case MarktRegime.Konsolidierung:
                     // Konsolidierung: NUR Bollinger-Squeeze-Breakouts erlaubt
                     if (!analyse.BollingerSqueeze)
                         return;
-                    minScore = 9; // vorher 8 - Muss absolut überzeugend sein
+                    minScore = 12; // vorher 9 - Nur absolute Ausnahme-Setups
                     break;
-                default: minScore = 8; break; // SchwacherTrend (vorher 7)
+                default: minScore = 11; break; // SchwacherTrend (vorher 8)
+            }
+
+            // ADX darf nicht fallend sein (Trend schwächt sich ab = schlechter Einstieg)
+            if (analyse.AdxFallend && analyse.Regime != MarktRegime.Konsolidierung)
+            {
+                minScore += 2; // Noch strengere Anforderung wenn Trend nachlässt
             }
 
             // HTF-Filter: Flexibel statt binärer Block
@@ -1252,8 +1276,8 @@ namespace cAlgo.Robots
 
             if (analyse.HtfTrend == TrendRichtung.Seitwaerts)
             {
-                htfBuyAufschlag = 1;
-                htfSellAufschlag = 1;
+                htfBuyAufschlag = 2; // vorher 1 - ohne klaren HTF-Trend viel schwieriger
+                htfSellAufschlag = 2;
             }
             else if (analyse.HtfTrend == TrendRichtung.Aufwaerts)
             {
@@ -1267,19 +1291,18 @@ namespace cAlgo.Robots
             int buyMinScore = minScore + htfBuyAufschlag;
             int sellMinScore = minScore + htfSellAufschlag;
 
-            // Score-Differenz: Richtung muss klar sein (v3.2: diff 3 statt 2)
-            if (buyScore >= buyMinScore && buyScore > sellScore + 3)
+            // Score-Differenz: Richtung muss absolut klar sein (v4.1: diff 4)
+            if (buyScore >= buyMinScore && buyScore > sellScore + 4)
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
-                // Erkannte Muster sammeln
                 string muster = ErkanntesMusterString(analyse, true);
                 Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0}{6} | Regime:{7} {8}",
                     buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke,
                     analyse.AdxSteigend ? "↑" : (analyse.AdxFallend ? "↓" : ""),
                     analyse.Regime, muster);
             }
-            else if (sellScore >= sellMinScore && sellScore > buyScore + 3)
+            else if (sellScore >= sellMinScore && sellScore > buyScore + 4)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
@@ -1329,16 +1352,18 @@ namespace cAlgo.Robots
             double stopLossPips = AtrZuPips(atr * _atrMultiplierSL * volAnpassungSL);
             double takeProfitPips = AtrZuPips(atr * _atrMultiplierTP * volAnpassungTP);
 
-            // Dynamische TP-Extension: Regime-, Score- und Vol-basiert
+            // Dynamische TP-Extension: Regime-, Score- und Vol-basiert (v4.1: höher)
             double tpMultiplier = 1.0;
             if (analyse.Regime == MarktRegime.StarkerTrend)
-                tpMultiplier = 1.8;
+                tpMultiplier = 2.2; // vorher 1.8 - Trend laufen lassen
             else if (analyse.Regime == MarktRegime.MittlererTrend)
-                tpMultiplier = 1.3;
+                tpMultiplier = 1.6; // vorher 1.3
 
-            // A+ Setups bekommen mindestens 1.4x TP
-            if (analyse.SignalScore >= 10)
-                tpMultiplier = Math.Max(tpMultiplier, 1.4);
+            // A+ Setups bekommen mindestens 1.8x TP (vorher 1.4)
+            if (analyse.SignalScore >= 14)
+                tpMultiplier = Math.Max(tpMultiplier, 2.0);
+            else if (analyse.SignalScore >= 11)
+                tpMultiplier = Math.Max(tpMultiplier, 1.8);
 
             if (tpMultiplier > 1.0)
             {
@@ -1536,55 +1561,56 @@ namespace cAlgo.Robots
                 double atrPips = AtrZuPips(atr);
                 double slPips = AtrZuPips(atr * _atrMultiplierSL);
 
-                // 1. BREAK-EVEN: bei 1.5R (nicht früher - Markt braucht Raum zum Atmen)
-                if (position.Pips > slPips * 1.5 && !IstBreakEven(position))
+                // 1. BREAK-EVEN: erst bei 2.5R (v4.1: vorher 1.5R - war zu früh, Trade braucht Raum)
+                if (position.Pips > slPips * 2.5 && !IstBreakEven(position))
                 {
                     SetzeBreakEven(position);
                 }
 
-                // 2a. PARTIAL CLOSE #1: 40% bei 2.5R sichern
-                if (position.Pips > slPips * 2.5
+                // 2a. PARTIAL CLOSE #1: 30% bei 3.5R sichern (vorher 40% bei 2.5R)
+                if (position.Pips > slPips * 3.5
                     && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2
                     && !_partialClosedPositions.Contains(position.Id))
+                {
+                    double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
+                        position.VolumeInUnits * 0.30, RoundingMode.Down);
+                    if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
+                    {
+                        ClosePosition(position, closeVolume);
+                        _partialClosedPositions.Add(position.Id);
+                        Print("PARTIAL #1: 30% bei +{0:F1} Pips (3.5R)", position.Pips);
+                    }
+                }
+
+                // 2b. PARTIAL CLOSE #2: Weitere 30% bei 6R (vorher 50% bei 4R)
+                if (position.Pips > slPips * 6.0
+                    && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2
+                    && _partialClosedPositions.Contains(position.Id)
+                    && !_secondPartialClosedPositions.Contains(position.Id))
                 {
                     double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
                         position.VolumeInUnits * 0.40, RoundingMode.Down);
                     if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
                     {
                         ClosePosition(position, closeVolume);
-                        _partialClosedPositions.Add(position.Id);
-                        Print("PARTIAL #1: 40% bei +{0:F1} Pips (2.5R)", position.Pips);
-                    }
-                }
-
-                // 2b. PARTIAL CLOSE #2: Weitere 30% bei 4R - Großteil der Gewinne sichern
-                if (position.Pips > slPips * 4.0
-                    && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2
-                    && _partialClosedPositions.Contains(position.Id)
-                    && !_secondPartialClosedPositions.Contains(position.Id))
-                {
-                    double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
-                        position.VolumeInUnits * 0.50, RoundingMode.Down);
-                    if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
-                    {
-                        ClosePosition(position, closeVolume);
                         _secondPartialClosedPositions.Add(position.Id);
-                        Print("PARTIAL #2: 50% bei +{0:F1} Pips (4R) - Rest läuft weiter", position.Pips);
+                        Print("PARTIAL #2: 40% bei +{0:F1} Pips (6R) - Rest läuft weiter", position.Pips);
                     }
                 }
 
-                // 2c. EARLY-EXIT bei Schwäche: Position in leichtem Profit aber Momentum kippt
-                if (position.Pips > slPips * 0.5 && position.Pips < slPips * 1.2
+                // 2c. EARLY-EXIT komplett entschärft: Nur noch bei EXTREMER Schwäche
+                // (v4.1: Nur bei 1.5-2.5R Profit UND alle 4 Gegen-Signale + ADX fallend)
+                if (position.Pips > slPips * 1.5 && position.Pips < slPips * 2.5
                     && !_partialClosedPositions.Contains(position.Id))
                 {
                     int gegenSignale = 0;
                     double rsi = _rsi.Result.Last(1);
 
-                    // RSI dreht gegen Position
-                    if (position.TradeType == TradeType.Buy && rsi > 70) gegenSignale++;
-                    if (position.TradeType == TradeType.Sell && rsi < 30) gegenSignale++;
+                    // RSI extrem gegen Position
+                    if (position.TradeType == TradeType.Buy && rsi > 78) gegenSignale++;
+                    if (position.TradeType == TradeType.Sell && rsi < 22) gegenSignale++;
 
-                    // MACD dreht gegen Position
+                    // MACD deutlich gegen Position
                     if (position.TradeType == TradeType.Buy
                         && _macd.Histogram.Last(1) < 0 && _macd.Histogram.Last(2) > 0) gegenSignale++;
                     if (position.TradeType == TradeType.Sell
@@ -1596,8 +1622,12 @@ namespace cAlgo.Robots
                     if (position.TradeType == TradeType.Buy && fast < med) gegenSignale++;
                     if (position.TradeType == TradeType.Sell && fast > med) gegenSignale++;
 
-                    // Bei 3 Gegen-Signalen: Lieber mit kleinem Gewinn raus als Verlust riskieren
-                    if (gegenSignale >= 3)
+                    // ADX fallend = Trend löst sich auf
+                    if (_adx.ADX.Last(1) < _adx.ADX.Last(2) && _adx.ADX.Last(2) < _adx.ADX.Last(3))
+                        gegenSignale++;
+
+                    // Nur bei 4+ Gegen-Signalen raus (vorher 3)
+                    if (gegenSignale >= 4)
                     {
                         Print("EARLY-EXIT: {0} Gegen-Signale bei +{1:F1} Pips - sichere Gewinn",
                             gegenSignale, position.Pips);
@@ -1606,32 +1636,32 @@ namespace cAlgo.Robots
                     }
                 }
 
-                // 3. PROGRESSIVER TRAILING STOP: Enger je höher der Gewinn
-                double trailingStart = slPips * 2.0;
+                // 3. PROGRESSIVER TRAILING STOP: Viel weiter - Trade laufen lassen
+                double trailingStart = slPips * 3.0; // vorher 2.0R
                 if (position.Pips > trailingStart)
                 {
                     double profitR = position.Pips / slPips;
 
-                    // Trailing-Distanz verkürzt sich mit steigendem Gewinn
+                    // Trailing-Distanz: Weiter als vorher, erst bei sehr hohem Profit enger
                     double trailingFaktor;
-                    if (profitR > 5.0)
-                        trailingFaktor = 0.6;  // 5R+: eng, Gewinn sichern
-                    else if (profitR > 3.5)
-                        trailingFaktor = 0.8;  // 3.5-5R: mittel
+                    if (profitR > 8.0)
+                        trailingFaktor = 0.7;  // 8R+: enger, großen Gewinn schützen
+                    else if (profitR > 5.0)
+                        trailingFaktor = 0.85; // 5-8R: etwas enger
                     else
-                        trailingFaktor = 1.0;  // 2-3.5R: normal
+                        trailingFaktor = 1.2;  // 3-5R: weit - Trade Raum geben (vorher 1.0)
 
                     double trailingDistanz = AtrZuPips(atr * _trailingAtrMultiplier * trailingFaktor);
 
-                    // Im starken Trend: etwas mehr Raum lassen
+                    // Im starken Trend: deutlich mehr Raum lassen
                     if (_aktuellesRegime == MarktRegime.StarkerTrend)
-                        trailingDistanz *= 1.3;
+                        trailingDistanz *= 1.5; // vorher 1.3
 
                     // Vol-Expansion: Breiterer Trail (mehr Noise)
                     if (_volatilitaetsRatio > 1.3)
-                        trailingDistanz *= 1.15;
+                        trailingDistanz *= 1.2;  // vorher 1.15
                     else if (_volatilitaetsRatio < 0.75)
-                        trailingDistanz *= 0.85;
+                        trailingDistanz *= 0.9;  // vorher 0.85
 
                     double neuerSL;
                     if (position.TradeType == TradeType.Buy)
@@ -1690,17 +1720,21 @@ namespace cAlgo.Robots
                 // Wie viele Bars ist die Position schon offen?
                 int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
 
-                // STALE TRADE: Position geht nirgendwohin
+                // STALE TRADE: Position geht nirgendwohin (v4.1: viel geduldiger)
                 double atrPipsStale = AtrZuPips(_atr.Result.Last(1));
-                // Flach: kaum Bewegung nach vielen Bars
-                if (barsOffen >= _staleTradeBarCount && Math.Abs(position.Pips) < atrPipsStale * 0.3)
+                // Flach: kaum Bewegung nach vielen Bars - aber im Trend mehr Geduld
+                int staleGeduld = _aktuellesRegime == MarktRegime.StarkerTrend
+                    || _aktuellesRegime == MarktRegime.MittlererTrend
+                    ? (int)(_staleTradeBarCount * 1.5)
+                    : _staleTradeBarCount;
+                if (barsOffen >= staleGeduld && Math.Abs(position.Pips) < atrPipsStale * 0.3)
                 {
                     Print("STALE TRADE geschlossen nach {0} Bars bei {1:F1} Pips (flach)", barsOffen, position.Pips);
                     ClosePosition(position);
                     continue;
                 }
-                // Lange im Minus: Nach 1.5x Stale-Count und immer noch negativ → Kapital freigeben
-                if (barsOffen >= (int)(_staleTradeBarCount * 1.5) && position.Pips < 0 && position.Pips > -atrPipsStale)
+                // Lange im Minus: Nach 2x Stale-Count und immer noch negativ
+                if (barsOffen >= (int)(_staleTradeBarCount * 2.0) && position.Pips < 0 && position.Pips > -atrPipsStale)
                 {
                     Print("STALE-LOSS geschlossen nach {0} Bars bei {1:F1} Pips (kleiner Verlust)", barsOffen, position.Pips);
                     ClosePosition(position);
@@ -1719,7 +1753,7 @@ namespace cAlgo.Robots
                 if (position.TradeType == TradeType.Sell && rsi < 15)
                     reversalZaehler++;
 
-                // EMA-Kreuzung gegen Position (nur mit Mindestgewinn von 1.5R)
+                // EMA-Kreuzung gegen Position (nur mit Mindestgewinn von 2.5R)
                 double fast = _emaFast.Result.Last(1);
                 double medium = _emaMedium.Result.Last(1);
                 double fastVorher = _emaFast.Result.Last(2);
@@ -1728,25 +1762,25 @@ namespace cAlgo.Robots
                 bool emaBearishCross = fastVorher >= mediumVorher && fast < medium;
                 bool emaBullishCross = fastVorher <= mediumVorher && fast > medium;
 
-                if (position.TradeType == TradeType.Buy && emaBearishCross && position.Pips > atrPipsReversal * 1.5)
+                if (position.TradeType == TradeType.Buy && emaBearishCross && position.Pips > atrPipsReversal * 2.5)
                     reversalZaehler++;
-                if (position.TradeType == TradeType.Sell && emaBullishCross && position.Pips > atrPipsReversal * 1.5)
+                if (position.TradeType == TradeType.Sell && emaBullishCross && position.Pips > atrPipsReversal * 2.5)
                     reversalZaehler++;
 
-                // MACD Umkehr gegen Position (nur mit deutlichem Gewinn von 2R)
+                // MACD Umkehr gegen Position (nur mit deutlichem Gewinn von 3R)
                 if (position.TradeType == TradeType.Buy && _macd.Histogram.Last(1) < 0
-                    && _macd.Histogram.Last(2) > 0 && position.Pips > atrPipsReversal * 2.0)
+                    && _macd.Histogram.Last(2) > 0 && position.Pips > atrPipsReversal * 3.0)
                 {
                     reversalZaehler++;
                 }
                 if (position.TradeType == TradeType.Sell && _macd.Histogram.Last(1) > 0
-                    && _macd.Histogram.Last(2) < 0 && position.Pips > atrPipsReversal * 2.0)
+                    && _macd.Histogram.Last(2) < 0 && position.Pips > atrPipsReversal * 3.0)
                 {
                     reversalZaehler++;
                 }
 
-                // Nur schließen wenn mindestens 2 Reversal-Indikatoren gleichzeitig feuern
-                if (reversalZaehler >= 2)
+                // v4.1: Nur schließen wenn mindestens 3 Reversal-Indikatoren feuern (vorher 2)
+                if (reversalZaehler >= 3)
                 {
                     Print("REVERSAL-EXIT ({0} Signale) bei {1:F1} Pips (RSI:{2:F0})",
                         reversalZaehler, position.Pips, rsi);
@@ -1890,7 +1924,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.0 gestoppt ===");
+            Print("=== FullAutoBot v4.1 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
