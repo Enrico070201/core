@@ -1,5 +1,5 @@
 // ============================================================================
-// FullAutoBot v4.4 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.5 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // 10 Parameter für volle Kontrolle - Rest wird automatisch berechnet.
 //
@@ -19,6 +19,18 @@
 //   Konservativ: Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5, max 1 Trade/Richtung
 //   Normal:      Standard-Werte (ausgewogen)
 //   Aggressiv:   Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5, max 3 Trades/Richtung
+//
+// v4.5 Bug-Fixes & Optimierungen:
+//   - Kelly-Criterion Fix: Kelly begrenzt Risiko jetzt korrekt nach unten
+//   - Volumen-Bonus direktional: Nur in Bar-Richtung (bullish→buy, bearish→sell)
+//   - Kerzenmuster rebalanciert: Max +3 Basis, +1 Kontext-Bonus (S/R, Trend)
+//   - Swing-Cache: Swing-Punkte 1x/Bar berechnet, von 3 Methoden wiederverwendet
+//   - Zero-ATR + Negative-Balance Guards in Position Sizing
+//   - Break-Even berücksichtigt Spread (Entry + Spread + 1 Pip)
+//   - DD-Schutz als harte Obergrenze nach allen Risiko-Multiplikatoren
+//   - Consecutive-Loss gradueller: 2L=0.8x, 3L=0.65x, 4L=0.5x, 5L=0.3x
+//   - Dead Code entfernt: _lastSpread, _spreadVolatilitaet, _vorherigerAvgSpread
+//   - OnStop: Sharpe-Ratio, Profit-Faktor, Erwartung, Max-Streaks, Return %
 //
 // v4.4 Keine Zeitbegrenzungen + bessere Parameter:
 //   - Session-Start/Ende Parameter durch Min R:R und TP-Faktor ersetzt
@@ -241,7 +253,6 @@ namespace cAlgo.Robots
 
         // Signal-Tracking
         private DateTime _lastTradeTime;
-        private double _lastSpread;
         private double _avgSpread;
         private int _spreadSampleCount;
         private MarktRegime _aktuellesRegime;
@@ -274,9 +285,7 @@ namespace cAlgo.Robots
         private int _recentSellWins;
         private int _recentSellLosses;
 
-        // Spread-Volatilitäts-Tracking
-        private double _spreadVolatilitaet;
-        private double _vorherigerAvgSpread;
+        // (v4.5: _spreadVolatilitaet und _vorherigerAvgSpread entfernt - waren unused)
 
         // Warm-up Tracking: Erste Trades mit reduziertem Risiko
         private int _totalTradeCount;
@@ -322,6 +331,10 @@ namespace cAlgo.Robots
         // Regime-Bestätigungs-Bars
         private int _regimeBestaetigungsBars;
 
+        // Swing-Cache: Einmal pro Bar berechnet, von allen Methoden genutzt
+        private List<double> _cachedSwingHighs = new List<double>();
+        private List<double> _cachedSwingLows = new List<double>();
+
         // Momentum-Schwelle (MACD Histogram % über Signal)
         private double _minMomentumSchwelle;
 
@@ -339,7 +352,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.4 gestartet ===");
+            Print("=== FullAutoBot v4.5 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -376,8 +389,7 @@ namespace cAlgo.Robots
             _volatilitaetsRatio = 1.0;
             _rollendeErwartung = 0;
             _rollendeWinRate = 0.5;
-            _spreadVolatilitaet = 0;
-            _vorherigerAvgSpread = _marktSymbol.Spread;
+            // (v4.5: dead code removed)
             _totalTradeCount = 0;
             _dailyStartBalance = Account.Balance;
             _dailyResetDate = Server.Time.Date;
@@ -699,6 +711,9 @@ namespace cAlgo.Robots
 
             // v4.2: Volatilitäts-Regime klassifizieren
             KlassifiziereVolatilitaetsRegime();
+
+            // v4.5: Swing-Punkte einmal pro Bar cachen (statt 3x berechnen)
+            AktualisiereSwingCache();
 
             // v4.2: Marktstruktur aktualisieren
             AktualisiereMarktStruktur();
@@ -1145,9 +1160,7 @@ namespace cAlgo.Robots
 
         private void ErkenneUnterstuetzungWiderstand(MarktAnalyse analyse)
         {
-            // Swing Highs/Lows der letzten 50 Bars finden
-            int lookback = 50;
-            int swingLen = 3; // 3 Bars links + 3 rechts = Swing-Punkt
+            // v4.5: Nutzt Swing-Cache statt eigene Berechnung
             double close = _marktBars.ClosePrices.Last(1);
             double atr = _atr.Result.Last(1);
             double toleranz = atr * 0.5; // S/R Zone statt exakter Preis
@@ -1155,39 +1168,18 @@ namespace cAlgo.Robots
             double naechsteUnterstuetzung = 0;
             double naechsterWiderstand = double.MaxValue;
 
-            if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
+            // Nächster Widerstand (über aktuellem Preis) aus Cache
+            foreach (double high in _cachedSwingHighs)
             {
-                analyse.NaechsteUnterstuetzung = 0;
-                analyse.NaechsterWiderstand = 0;
-                return;
+                if (high > close && high < naechsterWiderstand)
+                    naechsterWiderstand = high;
             }
 
-            for (int i = swingLen + 1; i < lookback; i++)
+            // Nächste Unterstützung (unter aktuellem Preis) aus Cache
+            foreach (double low in _cachedSwingLows)
             {
-                // Swing High: Höher als N Bars links und rechts
-                bool istSwingHigh = true;
-                bool istSwingLow = true;
-                double high_i = _marktBars.HighPrices.Last(i);
-                double low_i = _marktBars.LowPrices.Last(i);
-
-                for (int j = 1; j <= swingLen; j++)
-                {
-                    if (_marktBars.HighPrices.Last(i - j) >= high_i ||
-                        _marktBars.HighPrices.Last(i + j) >= high_i)
-                        istSwingHigh = false;
-
-                    if (_marktBars.LowPrices.Last(i - j) <= low_i ||
-                        _marktBars.LowPrices.Last(i + j) <= low_i)
-                        istSwingLow = false;
-                }
-
-                // Nächster Widerstand (über aktuellem Preis)
-                if (istSwingHigh && high_i > close && high_i < naechsterWiderstand)
-                    naechsterWiderstand = high_i;
-
-                // Nächste Unterstützung (unter aktuellem Preis)
-                if (istSwingLow && low_i < close && low_i > naechsteUnterstuetzung)
-                    naechsteUnterstuetzung = low_i;
+                if (low < close && low > naechsteUnterstuetzung)
+                    naechsteUnterstuetzung = low;
             }
 
             analyse.NaechsteUnterstuetzung = naechsteUnterstuetzung;
@@ -1206,46 +1198,16 @@ namespace cAlgo.Robots
 
         private void ErkenneDoubleTopBottom(MarktAnalyse analyse)
         {
-            int lookback = 40;
-            int swingLen = 3;
+            // v4.5: Nutzt Swing-Cache statt eigene Berechnung
             double close = _marktBars.ClosePrices.Last(1);
             double atr = _atr.Result.Last(1);
             double toleranz = atr * 0.3; // Wie nah müssen die Tops/Bottoms sein
 
-            if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
-                return;
-
-            // Sammle Swing Highs und Swing Lows
-            var swingHighs = new List<double>();
-            var swingLows = new List<double>();
-
-            for (int i = swingLen + 1; i < lookback; i++)
-            {
-                bool istSwingHigh = true;
-                bool istSwingLow = true;
-                double high_i = _marktBars.HighPrices.Last(i);
-                double low_i = _marktBars.LowPrices.Last(i);
-
-                for (int j = 1; j <= swingLen; j++)
-                {
-                    if (_marktBars.HighPrices.Last(i - j) >= high_i ||
-                        _marktBars.HighPrices.Last(i + j) >= high_i)
-                        istSwingHigh = false;
-
-                    if (_marktBars.LowPrices.Last(i - j) <= low_i ||
-                        _marktBars.LowPrices.Last(i + j) <= low_i)
-                        istSwingLow = false;
-                }
-
-                if (istSwingHigh) swingHighs.Add(high_i);
-                if (istSwingLow) swingLows.Add(low_i);
-            }
-
             // Double Top: Zwei nahe beieinanderliegende Swing Highs, Preis fällt darunter
-            for (int i = 0; i < swingHighs.Count - 1; i++)
+            for (int i = 0; i < _cachedSwingHighs.Count - 1; i++)
             {
-                if (Math.Abs(swingHighs[i] - swingHighs[i + 1]) < toleranz
-                    && close < swingHighs[i] - atr * 0.5)
+                if (Math.Abs(_cachedSwingHighs[i] - _cachedSwingHighs[i + 1]) < toleranz
+                    && close < _cachedSwingHighs[i] - atr * 0.5)
                 {
                     analyse.DoubleTopErkannt = true;
                     break;
@@ -1253,10 +1215,10 @@ namespace cAlgo.Robots
             }
 
             // Double Bottom: Zwei nahe Swing Lows, Preis steigt darüber
-            for (int i = 0; i < swingLows.Count - 1; i++)
+            for (int i = 0; i < _cachedSwingLows.Count - 1; i++)
             {
-                if (Math.Abs(swingLows[i] - swingLows[i + 1]) < toleranz
-                    && close > swingLows[i] + atr * 0.5)
+                if (Math.Abs(_cachedSwingLows[i] - _cachedSwingLows[i + 1]) < toleranz
+                    && close > _cachedSwingLows[i] + atr * 0.5)
                 {
                     analyse.DoubleBottomErkannt = true;
                     break;
@@ -1307,23 +1269,21 @@ namespace cAlgo.Robots
         }
 
         // =====================================================================
-        // v4.2: MARKTSTRUKTUR-ERKENNUNG (HH/HL/LL/LH)
+        // v4.5: SWING-CACHE (einmal pro Bar, von allen Methoden genutzt)
         // =====================================================================
 
-        private void AktualisiereMarktStruktur()
+        private void AktualisiereSwingCache()
         {
-            // Swing Points der letzten 30 Bars ermitteln
-            int lookback = 30;
+            _cachedSwingHighs.Clear();
+            _cachedSwingLows.Clear();
+
+            int lookback = 50; // Größter benötigter Lookback (S/R nutzt 50)
             int swingLen = 3;
 
             if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
                 return;
 
-            // Die zwei letzten Swing Highs und Swing Lows finden
-            var recentHighs = new List<double>();
-            var recentLows = new List<double>();
-
-            for (int i = swingLen + 1; i < lookback && (recentHighs.Count < 2 || recentLows.Count < 2); i++)
+            for (int i = swingLen + 1; i < lookback; i++)
             {
                 bool istSwingHigh = true;
                 bool istSwingLow = true;
@@ -1341,20 +1301,27 @@ namespace cAlgo.Robots
                         istSwingLow = false;
                 }
 
-                if (istSwingHigh && recentHighs.Count < 2) recentHighs.Add(high_i);
-                if (istSwingLow && recentLows.Count < 2) recentLows.Add(low_i);
+                if (istSwingHigh) _cachedSwingHighs.Add(high_i);
+                if (istSwingLow) _cachedSwingLows.Add(low_i);
             }
+        }
 
-            // Struktur aktualisieren
-            if (recentHighs.Count >= 2)
+        // =====================================================================
+        // v4.2: MARKTSTRUKTUR-ERKENNUNG (HH/HL/LL/LH) - v4.5: nutzt Cache
+        // =====================================================================
+
+        private void AktualisiereMarktStruktur()
+        {
+            // Struktur aktualisieren aus Cache
+            if (_cachedSwingHighs.Count >= 2)
             {
-                _letzterSwingHigh = recentHighs[0];
-                _vorLetzterSwingHigh = recentHighs[1];
+                _letzterSwingHigh = _cachedSwingHighs[0];
+                _vorLetzterSwingHigh = _cachedSwingHighs[1];
             }
-            if (recentLows.Count >= 2)
+            if (_cachedSwingLows.Count >= 2)
             {
-                _letzterSwingLow = recentLows[0];
-                _vorLetzterSwingLow = recentLows[1];
+                _letzterSwingLow = _cachedSwingLows[0];
+                _vorLetzterSwingLow = _cachedSwingLows[1];
             }
         }
 
@@ -1523,9 +1490,11 @@ namespace cAlgo.Robots
             if (analyse.StarkeMomentumKerze && analyse.IstBullishKerze) buyScore += 2;
             else if (analyse.IstBullishKerze && analyse.KerzenKoerper > analyse.UntererDocht) buyScore += 1;
 
-            // Erweiterte Kerzenmuster (v4, Gewicht: 2-4)
-            if (analyse.MorningStar) buyScore += 4;                   // Starkes Umkehrmuster
-            if (analyse.ThreeWhiteSoldiers) buyScore += 3;            // Starke Continuation
+            // Erweiterte Kerzenmuster (v4.5, Gewicht: 2-3+1 Kontext-Bonus)
+            if (analyse.MorningStar)                                  // Starkes Umkehrmuster
+            { buyScore += 3; if (analyse.PreisNahUnterstuetzung) buyScore += 1; }
+            if (analyse.ThreeWhiteSoldiers)                           // Starke Continuation
+            { buyScore += 2; if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 1; }
             if (analyse.BullishInsideBarBreakout) buyScore += 2;      // Breakout-Signal
             if (analyse.DojiAnUnterstuetzung) buyScore += 2;          // Unsicherheit am Support
             if (analyse.BullishTweezerBottom) buyScore += 2;          // Doppelboden-Kerze
@@ -1596,9 +1565,11 @@ namespace cAlgo.Robots
             if (analyse.StarkeMomentumKerze && analyse.IstBearishKerze) sellScore += 2;
             else if (analyse.IstBearishKerze && analyse.KerzenKoerper > analyse.ObererDocht) sellScore += 1;
 
-            // Erweiterte Kerzenmuster Sell (v4, Gewicht: 2-4)
-            if (analyse.EveningStar) sellScore += 4;
-            if (analyse.ThreeBlackCrows) sellScore += 3;
+            // Erweiterte Kerzenmuster Sell (v4.5, Gewicht: 2-3+1 Kontext-Bonus)
+            if (analyse.EveningStar)
+            { sellScore += 3; if (analyse.PreisNahWiderstand) sellScore += 1; }
+            if (analyse.ThreeBlackCrows)
+            { sellScore += 2; if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 1; }
             if (analyse.BearishInsideBarBreakout) sellScore += 2;
             if (analyse.DojiAnWiderstand) sellScore += 2;
             if (analyse.BearishTweezerTop) sellScore += 2;
@@ -1625,16 +1596,16 @@ namespace cAlgo.Robots
 
             // === v4.2: NEUE SCORING-PARAMETER ===
 
-            // Volumen-Bestätigung (Gewicht: 2) - Volumen über Durchschnitt = Überzeugung
+            // Volumen-Bestätigung (Gewicht: 2) - NUR in Bar-Richtung (bullish → buy, bearish → sell)
             if (analyse.VolumenUeberDurchschnitt)
             {
-                buyScore += 2;
-                sellScore += 2;
+                if (analyse.IstBullishKerze) buyScore += 2;
+                if (analyse.IstBearishKerze) sellScore += 2;
                 // Extra-Bonus bei starkem Volumen (>1.5x)
                 if (analyse.VolumenRatio >= 1.5)
                 {
-                    buyScore += 1;
-                    sellScore += 1;
+                    if (analyse.IstBullishKerze) buyScore += 1;
+                    if (analyse.IstBearishKerze) sellScore += 1;
                 }
             }
             else if (analyse.VolumenRatio < 0.7 && analyse.VolumenRatio > 0)
@@ -1824,8 +1795,13 @@ namespace cAlgo.Robots
             if ((Server.Time - _lastTradeTime).TotalMinutes < cooldownMinuten)
                 return;
 
-            // ATR-basierte Level mit Vol-Ratio-Anpassung
+            // v4.5: ATR Zero-Guard
             double atr = analyse.AtrWert;
+            if (atr <= 0)
+            {
+                Print("ATR ist 0 - kein Trade möglich");
+                return;
+            }
 
             // Volatilitäts-adaptive SL/TP-Multiplikatoren
             // Expandierende Vol (>1.2): Breiterer SL (Rauschen), höherer TP (größere Moves)
@@ -1936,8 +1912,10 @@ namespace cAlgo.Robots
             if (_totalWins + _totalLosses >= 20)
             {
                 double kellyRisk = BerechneKellyRisiko();
-                // Halbes Kelly als Sicherheitsnetz
-                risk = Math.Min(risk * 1.5, kellyRisk);
+                // Kelly als Obergrenze: Wenn Kelly weniger empfiehlt, reduziere
+                // Aber nie unter 30% des Basis-Risikos (Schutz bei negativem Kelly)
+                if (kellyRisk < risk)
+                    risk = Math.Max(kellyRisk, _baseRiskPercent * 0.3);
             }
 
             // === ADAPTIVE RISIKO-SKALIERUNG (v3.2: Gedämpft) ===
@@ -1955,13 +1933,17 @@ namespace cAlgo.Robots
                     risk *= 0.7;   // Leicht negativ: etwas bremsen
             }
 
-            // 2. Consecutive als Zusatz-Sicherung (Streak-Breaker)
+            // 2. Consecutive als Zusatz-Sicherung (v4.5: gradueller statt brutal)
             if (_consecutiveWins >= 4)
-                risk *= 1.1;   // Heißer Lauf (vorher 1.2)
-            if (_consecutiveLosses >= 3)
-                risk *= 0.4;   // Kalter Lauf - sofort bremsen
+                risk *= 1.1;   // Heißer Lauf
+            if (_consecutiveLosses >= 5)
+                risk *= 0.3;   // 5+ Verluste: stark bremsen
+            else if (_consecutiveLosses >= 4)
+                risk *= 0.5;   // 4 Verluste: deutlich bremsen
+            else if (_consecutiveLosses >= 3)
+                risk *= 0.65;  // 3 Verluste: bremsen (vorher 0.4 - zu hart)
             else if (_consecutiveLosses >= 2)
-                risk *= 0.65;  // Warnung
+                risk *= 0.8;   // 2 Verluste: leicht bremsen (vorher 0.65)
 
             // 3. Rolling WinRate Anpassung
             if (_rollendeErgebnissePips.Count >= 5)
@@ -2019,7 +2001,14 @@ namespace cAlgo.Robots
             else if (_dailyProfitPercent < -_dailyLossLimitPercent * 0.5)
                 risk *= 0.75; // Halbes Tageslimit verloren: bremsen
 
-            // Harte Grenzen: max 2.0x Basis
+            // v4.5: DD-Schutz nochmal als harte Obergrenze (verhindert dass spätere
+            // Multiplikatoren den DD-Schutz aushebeln)
+            if (_currentDrawdown >= _ddStufe2Prozent)
+                risk = Math.Min(risk, _baseRiskPercent * _ddStufe2Reduktion);
+            else if (_currentDrawdown >= _ddStufe1Prozent)
+                risk = Math.Min(risk, _baseRiskPercent * _ddStufe1Reduktion);
+
+            // Harte Grenzen: max 2.0x Basis, min 0.15%
             return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.0));
         }
 
@@ -2042,10 +2031,14 @@ namespace cAlgo.Robots
 
         private double BerechnePositionsGroesse(double stopLossPips, double riskPercent)
         {
+            // v4.5: Negative/Zero Balance Guard
+            if (Account.Balance <= 0)
+                return 0;
+
             double risikoBetrag = Account.Balance * (riskPercent / 100.0);
             double pipValue = _marktSymbol.PipValue;
 
-            if (pipValue <= 0 || stopLossPips <= 0)
+            if (pipValue <= 0 || stopLossPips <= 0 || risikoBetrag <= 0)
                 return _marktSymbol.VolumeInUnitsMin;
 
             return risikoBetrag / (stopLossPips * pipValue);
@@ -2193,8 +2186,9 @@ namespace cAlgo.Robots
 
         private void SetzeBreakEven(Position position)
         {
-            // SL auf Entry + 1 Pip setzen (leichter Gewinn garantiert)
-            double bePriceOffset = _marktSymbol.PipSize * 1;
+            // v4.5: SL auf Entry + Spread + 1 Pip (Spread-Kosten decken + leichter Gewinn)
+            double spreadPips = _marktSymbol.Spread;
+            double bePriceOffset = (spreadPips + 1) * _marktSymbol.PipSize;
             double bePrice;
 
             if (position.TradeType == TradeType.Buy)
@@ -2317,7 +2311,6 @@ namespace cAlgo.Robots
             double spread = _marktSymbol.Spread;
             _spreadSampleCount++;
             _avgSpread = _avgSpread + (spread - _avgSpread) / Math.Min(_spreadSampleCount, 100);
-            _lastSpread = spread;
         }
 
         private bool IstSpreadZuHoch()
@@ -2411,18 +2404,43 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.4 gestoppt ===");
+            Print("=== FullAutoBot v4.5 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
             {
                 double avgW = _summeGewinne / _totalWins;
                 double avgL = _summeVerluste / _totalLosses;
+                double profitFaktor = _summeVerluste > 0 ? _summeGewinne / _summeVerluste : 0;
+                double erwartung = (WinRate() * avgW) - ((1.0 - WinRate()) * avgL);
                 Print("Avg Win: +{0:F1} Pips | Avg Loss: -{1:F1} Pips | Payoff: {2:F2}",
                     avgW, avgL, avgW / Math.Max(avgL, 0.01));
+                Print("Profit-Faktor: {0:F2} | Erwartung: {1:F2} Pips/Trade", profitFaktor, erwartung);
             }
-            Print("Balance: {0:F2} | Peak: {1:F2} | Drawdown: {2:F1}%",
-                Account.Balance, _peakBalance, _currentDrawdown);
+
+            // v4.5: Risiko-adjustierte Metriken
+            if (_tradeResultsPips.Count >= 2)
+            {
+                double mittelwert = _tradeResultsPips.Average();
+                double varianz = _tradeResultsPips.Sum(x => (x - mittelwert) * (x - mittelwert)) / _tradeResultsPips.Count;
+                double stdAbw = Math.Sqrt(varianz);
+                double sharpeRatio = stdAbw > 0 ? mittelwert / stdAbw : 0;
+
+                // Max Consecutive berechnen
+                int maxConsecWin = 0, maxConsecLoss = 0, curWin = 0, curLoss = 0;
+                foreach (double r in _tradeResultsPips)
+                {
+                    if (r > 0) { curWin++; curLoss = 0; maxConsecWin = Math.Max(maxConsecWin, curWin); }
+                    else { curLoss++; curWin = 0; maxConsecLoss = Math.Max(maxConsecLoss, curLoss); }
+                }
+
+                Print("Sharpe-Ratio: {0:F2} | StdAbw: {1:F1} Pips | Max-Streak: {2}W / {3}L",
+                    sharpeRatio, stdAbw, maxConsecWin, maxConsecLoss);
+            }
+
+            double gesamtReturn = _initialBalance > 0 ? ((Account.Balance - _initialBalance) / _initialBalance) * 100 : 0;
+            Print("Balance: {0:F2} | Peak: {1:F2} | Return: {2:+0.00;-0.00}% | Max-DD: {3:F1}%",
+                Account.Balance, _peakBalance, gesamtReturn, _currentDrawdown);
             Print("Rolling Exp: {0:F1} | Rolling WR: {1:F0}% | Vol-Ratio: {2:F2}",
                 _rollendeErwartung, _rollendeWinRate * 100, _volatilitaetsRatio);
             Print("Buy WR: {0}/{1} | Sell WR: {2}/{3}",
@@ -2451,11 +2469,6 @@ namespace cAlgo.Robots
                 _volatilitaetsRatio = atrKurz / atrLang;
             else
                 _volatilitaetsRatio = 1.0;
-
-            // Spread-Volatilität tracken (wie stark schwankt der Spread)
-            double spreadDiff = Math.Abs(_avgSpread - _vorherigerAvgSpread);
-            _spreadVolatilitaet = _spreadVolatilitaet * 0.9 + spreadDiff * 0.1;
-            _vorherigerAvgSpread = _avgSpread;
         }
 
         private void AktualisiereRollendeErwartung()
