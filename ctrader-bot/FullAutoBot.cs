@@ -1,8 +1,27 @@
 // ============================================================================
-// FullAutoBot v4.1 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.2 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
 // Alles andere wird automatisch berechnet und angepasst.
+//
+// v4.2 Neue Parameter & Features:
+//   ENTRY-QUALITÄT:
+//   - Volumen-Bestätigung: Tick-Volume vs 20-Bar Durchschnitt (Score +2/+3 oder -1)
+//   - Marktstruktur-Erkennung: HH/HL (Aufwärts) + LL/LH (Abwärts) Tracking (Score +2)
+//   - Break of Structure (BoS): Strukturbruch als starkes Signal (Score +3)
+//   - Momentum-Filter: Min. Momentum nötig (30% ATR oder MACD-Zuwachs) (Score +1/-2)
+//   - Volatilitäts-Regime: Niedrig/Normal/Hoch/Extrem Klassifizierung
+//     → Extrem blockiert neue Trades, Niedrig = Score -1, Hoch = Score +1
+//   RISIKO-MANAGEMENT:
+//   - Progressiver Equity-Schutz: 2-Stufen DD (35%/65% vom MaxDD)
+//     → Stufe 1: 50% Risikoreduktion, Stufe 2: 75% Reduktion
+//   - Richtungslimit: Max 2 Trades in gleicher Richtung (kein Klumpenrisiko)
+//   EXIT-MANAGEMENT:
+//   - Maximale Haltezeit: Harter Timeout pro Timeframe (Scalp 120, Intra 60, Swing 40)
+//   - Session-Ende Auto-Close: Schließt kleine Positionen N Min vor Session-Ende
+//   QUALITÄTSFILTER:
+//   - Regime-Bestätigungs-Bars: Konfigurierbar (2-3 je nach TF, vorher fix 2)
+//   - Konfigurierbarer Momentum-Schwellenwert pro Timeframe
 //
 // v4.1 Signalqualität + Haltedauer:
 //   - minScore massiv erhöht: StarkerTrend 9, MittlererTrend 10, SchwacherTrend 11, Konso 12
@@ -210,6 +229,41 @@ namespace cAlgo.Robots
         // Min Risk:Reward Ratio
         private double _minRiskReward;
 
+        // === v4.2: NEUE PARAMETER ===
+
+        // Volumen-Bestätigung
+        private Bars _tickVolumeBars; // Referenz auf aktuelle Bars (Tick Volume)
+
+        // Marktstruktur: HH/HL/LL/LH Tracking
+        private double _letzterSwingHigh;
+        private double _letzterSwingLow;
+        private double _vorLetzterSwingHigh;
+        private double _vorLetzterSwingLow;
+
+        // Volatilitäts-Regime Klassifizierung
+        private VolatilitaetsRegime _aktuellesVolRegime;
+
+        // Max Haltezeit (in Minuten, berechnet aus Timeframe)
+        private int _maxHaltezeitBars;
+
+        // Session-Ende Auto-Close (Minuten vor Session-Ende)
+        private int _sessionEndeVorlaufMinuten;
+
+        // Max Trades in gleicher Richtung
+        private int _maxTradesGleicheRichtung;
+
+        // Regime-Bestätigungs-Bars
+        private int _regimeBestaetigungsBars;
+
+        // Momentum-Schwelle (MACD Histogram % über Signal)
+        private double _minMomentumSchwelle;
+
+        // Equity-Schutz: Progressive DD-Stufen
+        private double _ddStufe1Prozent;  // Ab wann Stufe 1 greift
+        private double _ddStufe1Reduktion; // Risikoreduktion in Stufe 1
+        private double _ddStufe2Prozent;  // Ab wann Stufe 2 greift
+        private double _ddStufe2Reduktion; // Risikoreduktion in Stufe 2
+
         private const string BotLabel = "FullAutoBot";
 
         // =====================================================================
@@ -218,7 +272,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.1 gestartet ===");
+            Print("=== FullAutoBot v4.2 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -264,12 +318,25 @@ namespace cAlgo.Robots
             _sessionQualitaet = 1.0;
             _minRiskReward = 2.0; // Mindestens 2:1 R:R sonst kein Trade (vorher 1.8)
 
+            // v4.2: Neue Variablen initialisieren
+            _tickVolumeBars = _marktBars; // Volumen kommt von den Markt-Bars
+            _letzterSwingHigh = 0;
+            _letzterSwingLow = double.MaxValue;
+            _vorLetzterSwingHigh = 0;
+            _vorLetzterSwingLow = double.MaxValue;
+            _aktuellesVolRegime = VolatilitaetsRegime.Normal;
+
             // Events registrieren
             _marktBars.BarOpened += OnBarOpened;
             Positions.Closed += OnPositionClosed;
 
             Print("Bot initialisiert | Basis-Risiko: {0:F2}% | Max Drawdown: {1:F1}%",
                 _baseRiskPercent, _maxDrawdownPercent);
+            Print("v4.2 Parameter: MaxHalte={0}Bars | SessionClose={1}Min | RichtungsLimit={2} | RegimeBest={3}Bars | MinMomentum={4:F2}",
+                _maxHaltezeitBars, _sessionEndeVorlaufMinuten, _maxTradesGleicheRichtung,
+                _regimeBestaetigungsBars, _minMomentumSchwelle);
+            Print("DD-Schutz: Stufe1 ab {0:F1}% (x{1:F2}) | Stufe2 ab {2:F1}% (x{3:F2})",
+                _ddStufe1Prozent, _ddStufe1Reduktion, _ddStufe2Prozent, _ddStufe2Reduktion);
         }
 
         // =====================================================================
@@ -290,6 +357,11 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 0.8; _maxDrawdownPercent = 6.0;
                 _maxOpenPositions = 2; _signalCooldown = 4; _staleTradeBarCount = 50;
                 _dailyLossLimitPercent = 2.0;
+                _maxHaltezeitBars = 120;         // 10h bei M5
+                _sessionEndeVorlaufMinuten = 30; // 30 Min vor Session-Ende raus
+                _maxTradesGleicheRichtung = 2;
+                _regimeBestaetigungsBars = 3;
+                _minMomentumSchwelle = 0.15;     // 15% MACD-Histogram über Vorgänger
             }
             else if (tfMinuten <= 30)
             {
@@ -301,6 +373,11 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 1.2; _maxDrawdownPercent = 8.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 40;
                 _dailyLossLimitPercent = 2.5;
+                _maxHaltezeitBars = 60;          // 30h bei M30
+                _sessionEndeVorlaufMinuten = 45;
+                _maxTradesGleicheRichtung = 2;
+                _regimeBestaetigungsBars = 3;
+                _minMomentumSchwelle = 0.10;
             }
             else if (tfMinuten <= 240)
             {
@@ -312,6 +389,11 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 1.6; _maxDrawdownPercent = 10.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
                 _dailyLossLimitPercent = 3.0;
+                _maxHaltezeitBars = 40;          // Swing: mehr Geduld
+                _sessionEndeVorlaufMinuten = 0;  // Swing ignoriert Session-Ende
+                _maxTradesGleicheRichtung = 2;
+                _regimeBestaetigungsBars = 2;
+                _minMomentumSchwelle = 0.08;
             }
             else
             {
@@ -323,7 +405,18 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 2.2; _maxDrawdownPercent = 12.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 25;
                 _dailyLossLimitPercent = 3.5;
+                _maxHaltezeitBars = 30;          // Positions: sehr geduldig
+                _sessionEndeVorlaufMinuten = 0;  // Positions ignoriert Session-Ende
+                _maxTradesGleicheRichtung = 2;
+                _regimeBestaetigungsBars = 2;
+                _minMomentumSchwelle = 0.05;
             }
+
+            // Equity-Schutz: Gleich für alle Timeframes
+            _ddStufe1Prozent = _maxDrawdownPercent * 0.35;  // 35% des Max-DD
+            _ddStufe1Reduktion = 0.5;                       // 50% weniger Risiko
+            _ddStufe2Prozent = _maxDrawdownPercent * 0.65;  // 65% des Max-DD
+            _ddStufe2Reduktion = 0.25;                      // 75% weniger Risiko
         }
 
         // =====================================================================
@@ -449,6 +542,12 @@ namespace cAlgo.Robots
             // Volatilitäts-Regime aktualisieren
             AktualisiereVolatilitaetsRegime();
 
+            // v4.2: Volatilitäts-Regime klassifizieren
+            KlassifiziereVolatilitaetsRegime();
+
+            // v4.2: Marktstruktur aktualisieren
+            AktualisiereMarktStruktur();
+
             // Session-Qualität aktualisieren
             _sessionQualitaet = BerechneSessionQualitaet();
 
@@ -484,10 +583,15 @@ namespace cAlgo.Robots
             // Stale Trades prüfen und schließen
             PruefeStaleTradesUndReversals();
 
-            // Regime-Cooldown: Nach Wechsel 2 Bars warten (neues Regime muss sich bestätigen)
-            if (_barsSeitRegimeWechsel < 2)
+            // v4.2: Session-Ende Auto-Close (nur für Intraday/Scalping)
+            if (_sessionEndeVorlaufMinuten > 0)
+                PruefeSessionEndeAutoClose();
+
+            // v4.2: Regime-Cooldown mit konfigurierbaren Bestätigungs-Bars
+            if (_barsSeitRegimeWechsel < _regimeBestaetigungsBars)
             {
-                Print("Regime-Cooldown: {0} Bars seit Wechsel - warte", _barsSeitRegimeWechsel);
+                Print("Regime-Cooldown: {0}/{1} Bars seit Wechsel - warte",
+                    _barsSeitRegimeWechsel, _regimeBestaetigungsBars);
                 return;
             }
 
@@ -680,16 +784,28 @@ namespace cAlgo.Robots
             // 16. ADX-Dynamik (steigend/fallend)
             ErkenneAdxDynamik(analyse);
 
-            // 17. Volle Konfluenz: HTF + EMA + 200 EMA alle in gleicher Richtung
+            // 17. v4.2: Volumen-Bestätigung
+            AnalysiereVolumen(analyse);
+
+            // 18. v4.2: Marktstruktur (HH/HL/LL/LH)
+            AnalysiereMarktStruktur(analyse);
+
+            // 19. v4.2: Volatilitäts-Regime
+            analyse.VolRegime = _aktuellesVolRegime;
+
+            // 20. v4.2: Momentum-Filter
+            AnalysiereMomentum(analyse);
+
+            // 21. Volle Konfluenz: HTF + EMA + 200 EMA alle in gleicher Richtung
             analyse.VolleKonfluenzBuy = analyse.HtfTrend == TrendRichtung.Aufwaerts
                 && analyse.EmaSignal == TrendRichtung.Aufwaerts && analyse.UeberEma200;
             analyse.VolleKonfluenzSell = analyse.HtfTrend == TrendRichtung.Abwaerts
                 && analyse.EmaSignal == TrendRichtung.Abwaerts && !analyse.UeberEma200;
 
-            // 18. Markt-Regime
+            // 22. Markt-Regime
             analyse.Regime = _aktuellesRegime;
 
-            // 19. Gesamtsignal berechnen
+            // 23. Gesamtsignal berechnen
             BerechneGesamtSignal(analyse);
 
             return analyse;
@@ -1016,6 +1132,155 @@ namespace cAlgo.Robots
         }
 
         // =====================================================================
+        // v4.2: VOLUMEN-BESTÄTIGUNG
+        // =====================================================================
+
+        private void AnalysiereVolumen(MarktAnalyse analyse)
+        {
+            // Tick-Volume als Proxy für echtes Volumen (FX hat kein zentrales Volumen)
+            if (_tickVolumeBars.TickVolumes.Count < 22) return;
+
+            double aktuellesVolumen = _tickVolumeBars.TickVolumes.Last(1);
+
+            // Durchschnitt der letzten 20 Bars
+            double summeVol = 0;
+            for (int i = 2; i <= 21; i++)
+                summeVol += _tickVolumeBars.TickVolumes.Last(i);
+            double durchschnittVol = summeVol / 20.0;
+
+            if (durchschnittVol > 0)
+            {
+                analyse.VolumenRatio = aktuellesVolumen / durchschnittVol;
+                analyse.VolumenUeberDurchschnitt = analyse.VolumenRatio >= 1.2; // 20% über Durchschnitt
+            }
+        }
+
+        // =====================================================================
+        // v4.2: MARKTSTRUKTUR-ERKENNUNG (HH/HL/LL/LH)
+        // =====================================================================
+
+        private void AktualisiereMarktStruktur()
+        {
+            // Swing Points der letzten 30 Bars ermitteln
+            int lookback = 30;
+            int swingLen = 3;
+
+            if (_marktBars.HighPrices.Count < lookback + swingLen + 1)
+                return;
+
+            // Die zwei letzten Swing Highs und Swing Lows finden
+            var recentHighs = new List<double>();
+            var recentLows = new List<double>();
+
+            for (int i = swingLen + 1; i < lookback && (recentHighs.Count < 2 || recentLows.Count < 2); i++)
+            {
+                bool istSwingHigh = true;
+                bool istSwingLow = true;
+                double high_i = _marktBars.HighPrices.Last(i);
+                double low_i = _marktBars.LowPrices.Last(i);
+
+                for (int j = 1; j <= swingLen; j++)
+                {
+                    if (_marktBars.HighPrices.Last(i - j) >= high_i ||
+                        _marktBars.HighPrices.Last(i + j) >= high_i)
+                        istSwingHigh = false;
+
+                    if (_marktBars.LowPrices.Last(i - j) <= low_i ||
+                        _marktBars.LowPrices.Last(i + j) <= low_i)
+                        istSwingLow = false;
+                }
+
+                if (istSwingHigh && recentHighs.Count < 2) recentHighs.Add(high_i);
+                if (istSwingLow && recentLows.Count < 2) recentLows.Add(low_i);
+            }
+
+            // Struktur aktualisieren
+            if (recentHighs.Count >= 2)
+            {
+                _letzterSwingHigh = recentHighs[0];
+                _vorLetzterSwingHigh = recentHighs[1];
+            }
+            if (recentLows.Count >= 2)
+            {
+                _letzterSwingLow = recentLows[0];
+                _vorLetzterSwingLow = recentLows[1];
+            }
+        }
+
+        private void AnalysiereMarktStruktur(MarktAnalyse analyse)
+        {
+            if (_letzterSwingHigh == 0 || _vorLetzterSwingHigh == 0) return;
+            if (_letzterSwingLow == double.MaxValue || _vorLetzterSwingLow == double.MaxValue) return;
+
+            double close = _marktBars.ClosePrices.Last(1);
+
+            // Higher High + Higher Low = Aufwärtstrend intakt
+            analyse.HigherHighs = _letzterSwingHigh > _vorLetzterSwingHigh
+                && _letzterSwingLow > _vorLetzterSwingLow;
+
+            // Lower Low + Lower High = Abwärtstrend intakt
+            analyse.LowerLows = _letzterSwingLow < _vorLetzterSwingLow
+                && _letzterSwingHigh < _vorLetzterSwingHigh;
+
+            // Break of Structure: Preis durchbricht letzten Swing-Punkt
+            analyse.StrukturBruchBullish = close > _letzterSwingHigh && analyse.LowerLows;
+            analyse.StrukturBruchBearish = close < _letzterSwingLow && analyse.HigherHighs;
+        }
+
+        // =====================================================================
+        // v4.2: VOLATILITÄTS-REGIME KLASSIFIZIERUNG
+        // =====================================================================
+
+        private void KlassifiziereVolatilitaetsRegime()
+        {
+            // ATR als Prozent des Preises - universell über alle Instrumente
+            double close = _marktBars.ClosePrices.Last(1);
+            if (close <= 0) return;
+
+            double atrProzent = (_atr.Result.Last(1) / close) * 100;
+
+            // Dynamische Schwellen basierend auf historischem Durchschnitt
+            // Benutze Vol-Ratio als Zusatz-Indikator
+            if (atrProzent > 3.0 || _volatilitaetsRatio > 2.5)
+                _aktuellesVolRegime = VolatilitaetsRegime.Extrem;
+            else if (atrProzent > 1.5 || _volatilitaetsRatio > 1.5)
+                _aktuellesVolRegime = VolatilitaetsRegime.Hoch;
+            else if (atrProzent < 0.05 || _volatilitaetsRatio < 0.5)
+                _aktuellesVolRegime = VolatilitaetsRegime.Niedrig;
+            else
+                _aktuellesVolRegime = VolatilitaetsRegime.Normal;
+        }
+
+        // =====================================================================
+        // v4.2: MOMENTUM-FILTER
+        // =====================================================================
+
+        private void AnalysiereMomentum(MarktAnalyse analyse)
+        {
+            // Momentum = Wie stark ist die aktuelle Bewegung relativ zur ATR
+            double close = _marktBars.ClosePrices.Last(1);
+            double prevClose = _marktBars.ClosePrices.Last(2);
+            double atr = _atr.Result.Last(1);
+
+            if (atr <= 0) return;
+
+            // Absolute Bewegung relativ zur ATR (0-100+)
+            double bewegung = Math.Abs(close - prevClose);
+            analyse.MomentumStaerke = (bewegung / atr) * 100;
+
+            // MACD Momentum: Histogram muss in Richtung des Signals zunehmen
+            double histAktuell = Math.Abs(_macd.Histogram.Last(1));
+            double histVorher = Math.Abs(_macd.Histogram.Last(2));
+
+            bool macdMomentumOk = histVorher > 0
+                ? (histAktuell / histVorher - 1.0) >= _minMomentumSchwelle
+                : histAktuell > 0;
+
+            // Momentum ausreichend wenn: Bewegung > 30% ATR ODER MACD nimmt zu
+            analyse.MomentumAusreichend = analyse.MomentumStaerke >= 30 || macdMomentumOk;
+        }
+
+        // =====================================================================
         // TREND-ERKENNUNG
         // =====================================================================
 
@@ -1207,6 +1472,64 @@ namespace cAlgo.Robots
             if (analyse.AtrExpandiert) sellScore += 1;
             if (analyse.VolleKonfluenzSell) sellScore += 2;
 
+            // === v4.2: NEUE SCORING-PARAMETER ===
+
+            // Volumen-Bestätigung (Gewicht: 2) - Volumen über Durchschnitt = Überzeugung
+            if (analyse.VolumenUeberDurchschnitt)
+            {
+                buyScore += 2;
+                sellScore += 2;
+                // Extra-Bonus bei starkem Volumen (>1.5x)
+                if (analyse.VolumenRatio >= 1.5)
+                {
+                    buyScore += 1;
+                    sellScore += 1;
+                }
+            }
+            else if (analyse.VolumenRatio < 0.7 && analyse.VolumenRatio > 0)
+            {
+                // Schwaches Volumen = wenig Überzeugung
+                buyScore -= 1;
+                sellScore -= 1;
+            }
+
+            // Marktstruktur (Gewicht: 2-3) - HH/HL oder LL/LH bestätigt Trendrichtung
+            if (analyse.HigherHighs) buyScore += 2;    // Aufwärtsstruktur intakt
+            if (analyse.LowerLows) sellScore += 2;     // Abwärtsstruktur intakt
+            if (analyse.HigherHighs) sellScore -= 1;   // Gegen Aufwärtsstruktur = Risiko
+            if (analyse.LowerLows) buyScore -= 1;      // Gegen Abwärtsstruktur = Risiko
+
+            // Break of Structure (Gewicht: 3) - Strukturbruch = starkes Signal
+            if (analyse.StrukturBruchBullish) buyScore += 3;
+            if (analyse.StrukturBruchBearish) sellScore += 3;
+
+            // Momentum-Filter (Gewicht: 1-2) - Mindest-Momentum als Qualitätsfilter
+            if (analyse.MomentumAusreichend)
+            {
+                buyScore += 1;
+                sellScore += 1;
+            }
+            else
+            {
+                // Kein Momentum = Signal ist schwach
+                buyScore -= 2;
+                sellScore -= 2;
+            }
+
+            // Volatilitäts-Regime Bonus/Malus (Gewicht: 1)
+            if (analyse.VolRegime == VolatilitaetsRegime.Hoch)
+            {
+                // Hohe Vol = größere Moves möglich aber auch riskanter
+                buyScore += 1;
+                sellScore += 1;
+            }
+            else if (analyse.VolRegime == VolatilitaetsRegime.Niedrig)
+            {
+                // Niedrige Vol = wenig Bewegung erwartet
+                buyScore -= 1;
+                sellScore -= 1;
+            }
+
             // --- SESSION-QUALITÄTS-BONUS (v3.3: granular statt flat +1) ---
             if (_sessionQualitaet >= 0.9)
             {
@@ -1323,6 +1646,23 @@ namespace cAlgo.Robots
             var offene = Positions.FindAll(BotLabel, _marktSymbol.Name);
             if (offene.Length >= _maxOpenPositions)
                 return;
+
+            // v4.2: Richtungslimit prüfen - max N Trades in gleicher Richtung
+            TradeType geplant = analyse.Signal == SignalTyp.Buy ? TradeType.Buy : TradeType.Sell;
+            int gleicheRichtung = offene.Count(p => p.TradeType == geplant);
+            if (gleicheRichtung >= _maxTradesGleicheRichtung)
+            {
+                Print("RICHTUNGSLIMIT: Bereits {0} {1}-Trades offen (max {2})",
+                    gleicheRichtung, geplant, _maxTradesGleicheRichtung);
+                return;
+            }
+
+            // v4.2: Extremes Volatilitäts-Regime blockiert neue Trades
+            if (_aktuellesVolRegime == VolatilitaetsRegime.Extrem)
+            {
+                Print("VOL-REGIME EXTREM: Kein neuer Trade bei extremer Volatilität");
+                return;
+            }
 
             // Cooldown prüfen (kürzer bei Pyramide)
             double cooldownMinuten = _signalCooldown * TimeframeZuMinuten(BotTimeframe);
@@ -1475,12 +1815,19 @@ namespace cAlgo.Robots
                     risk *= 0.6;  // Niedrige Trefferquote
             }
 
-            // 4. Drawdown-Skalierung: ab 50% des Max-DD bremsen
+            // 4. v4.2: Progressiver Equity-Schutz (ersetzt alte stufenlose DD-Skalierung)
             _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
-            if (_currentDrawdown > _maxDrawdownPercent * 0.5)
+            if (_currentDrawdown >= _ddStufe2Prozent)
             {
-                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.5) / (_maxDrawdownPercent * 0.5));
-                risk *= Math.Max(0.2, ddFaktor);
+                risk *= _ddStufe2Reduktion;
+                Print("DD-SCHUTZ Stufe 2: DD {0:F1}% >= {1:F1}% -> Risiko x{2:F2}",
+                    _currentDrawdown, _ddStufe2Prozent, _ddStufe2Reduktion);
+            }
+            else if (_currentDrawdown >= _ddStufe1Prozent)
+            {
+                risk *= _ddStufe1Reduktion;
+                Print("DD-SCHUTZ Stufe 1: DD {0:F1}% >= {1:F1}% -> Risiko x{2:F2}",
+                    _currentDrawdown, _ddStufe1Prozent, _ddStufe1Reduktion);
             }
 
             // 5. Signal-Score-Bonus: Gedämpft - max 1.5x statt 2.0x
@@ -1720,6 +2067,15 @@ namespace cAlgo.Robots
                 // Wie viele Bars ist die Position schon offen?
                 int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
 
+                // v4.2: MAXIMALE HALTEZEIT - harter Timeout
+                if (_maxHaltezeitBars > 0 && barsOffen >= _maxHaltezeitBars)
+                {
+                    Print("MAX-HALTEZEIT: {0} Bars ({1} max) bei {2:F1} Pips - schließe",
+                        barsOffen, _maxHaltezeitBars, position.Pips);
+                    ClosePosition(position);
+                    continue;
+                }
+
                 // STALE TRADE: Position geht nirgendwohin (v4.1: viel geduldiger)
                 double atrPipsStale = AtrZuPips(_atr.Result.Last(1));
                 // Flach: kaum Bewegung nach vielen Bars - aber im Trend mehr Geduld
@@ -1785,6 +2141,36 @@ namespace cAlgo.Robots
                     Print("REVERSAL-EXIT ({0} Signale) bei {1:F1} Pips (RSI:{2:F0})",
                         reversalZaehler, position.Pips, rsi);
                     ClosePosition(position);
+                }
+            }
+        }
+
+        // =====================================================================
+        // v4.2: SESSION-ENDE AUTO-CLOSE
+        // =====================================================================
+
+        private void PruefeSessionEndeAutoClose()
+        {
+            int stunde = Server.Time.Hour;
+            int minute = Server.Time.Minute;
+            int sessionEndStunde = 20; // Session-Ende: 20 UTC
+
+            // Berechne Minuten bis Session-Ende
+            int minutenBisEnde = (sessionEndStunde - stunde) * 60 - minute;
+
+            if (minutenBisEnde > 0 && minutenBisEnde <= _sessionEndeVorlaufMinuten)
+            {
+                var positionen = Positions.FindAll(BotLabel, _marktSymbol.Name);
+                foreach (var pos in positionen)
+                {
+                    // Nur Positionen schließen die wenig im Gewinn sind (große Runner laufen lassen)
+                    double atrPips = AtrZuPips(_atr.Result.Last(1));
+                    if (pos.Pips < atrPips * 2.0) // Weniger als 2 ATR Gewinn
+                    {
+                        Print("SESSION-ENDE: Schließe {0} bei {1:F1} Pips ({2} Min bis Session-Ende)",
+                            pos.TradeType, pos.Pips, minutenBisEnde);
+                        ClosePosition(pos);
+                    }
                 }
             }
         }
@@ -1924,7 +2310,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.1 gestoppt ===");
+            Print("=== FullAutoBot v4.2 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
@@ -1943,6 +2329,9 @@ namespace cAlgo.Robots
                 _recentSellWins, _recentSellWins + _recentSellLosses);
             Print("Heute: PnL {0:+0.00;-0.00}% | Trades: {1} | Session-Q: {2:F2}",
                 _dailyProfitPercent, _dailyTradeCount, _sessionQualitaet);
+            Print("Vol-Regime: {0} | Struktur: SH={1:F5} SL={2:F5} | DD-Stufen: {3:F1}%/{4:F1}%",
+                _aktuellesVolRegime, _letzterSwingHigh, _letzterSwingLow,
+                _ddStufe1Prozent, _ddStufe2Prozent);
 
             _marktBars.BarOpened -= OnBarOpened;
             Positions.Closed -= OnPositionClosed;
@@ -2011,6 +2400,10 @@ namespace cAlgo.Robots
                 if (a.DoubleBottomErkannt) muster.Add("DoubleBottom");
                 if (a.PreisNahUnterstuetzung) muster.Add("@Support");
                 if (a.RsiBullishDivergenz) muster.Add("RSI-Div");
+                if (a.HigherHighs) muster.Add("HH/HL");
+                if (a.StrukturBruchBullish) muster.Add("BoS↑");
+                if (a.VolumenUeberDurchschnitt) muster.Add("Vol+" + (a.VolumenRatio >= 1.5 ? "+" : ""));
+                if (a.MomentumAusreichend) muster.Add("Mom✓");
             }
             else
             {
@@ -2024,6 +2417,10 @@ namespace cAlgo.Robots
                 if (a.DoubleTopErkannt) muster.Add("DoubleTop");
                 if (a.PreisNahWiderstand) muster.Add("@Resist");
                 if (a.RsiBearishDivergenz) muster.Add("RSI-Div");
+                if (a.LowerLows) muster.Add("LL/LH");
+                if (a.StrukturBruchBearish) muster.Add("BoS↓");
+                if (a.VolumenUeberDurchschnitt) muster.Add("Vol+" + (a.VolumenRatio >= 1.5 ? "+" : ""));
+                if (a.MomentumAusreichend) muster.Add("Mom✓");
             }
             return muster.Count > 0 ? "| " + string.Join(", ", muster) : "";
         }
@@ -2158,6 +2555,26 @@ namespace cAlgo.Robots
             public MarktRegime Regime { get; set; }
             public SignalTyp Signal { get; set; }
             public int SignalScore { get; set; }
+
+            // v4.2: Volumen-Bestätigung
+            public bool VolumenUeberDurchschnitt { get; set; }
+            public double VolumenRatio { get; set; } // Aktuell / Durchschnitt
+
+            // v4.2: Marktstruktur
+            public bool HigherHighs { get; set; }  // HH + HL = Aufwärtstrend intakt
+            public bool LowerLows { get; set; }    // LL + LH = Abwärtstrend intakt
+            public bool StrukturBruchBullish { get; set; } // Break of Structure nach oben
+            public bool StrukturBruchBearish { get; set; } // Break of Structure nach unten
+
+            // v4.2: Volatilitäts-Regime
+            public VolatilitaetsRegime VolRegime { get; set; }
+
+            // v4.2: Momentum-Stärke
+            public double MomentumStaerke { get; set; } // Wie stark ist die Bewegung (0-100)
+            public bool MomentumAusreichend { get; set; }
         }
+
+        // v4.2: Volatilitäts-Regime Enum
+        private enum VolatilitaetsRegime { Niedrig, Normal, Hoch, Extrem }
     }
 }
