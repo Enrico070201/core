@@ -1,5 +1,5 @@
 // ============================================================================
-// FullAutoBot v4.3 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.4 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // 10 Parameter für volle Kontrolle - Rest wird automatisch berechnet.
 //
@@ -12,21 +12,22 @@
 //   6. Max Tagesverlust % - Tägliches Verlustlimit (0=Auto)
 //   7. Max Positionen     - Gleichzeitig offene Trades (0=Auto)
 //   8. Max Trades/Tag     - Übertrading-Schutz (0=Auto)
-//   9. Session Start UTC  - Beginn der Handelszeit (-1=Auto: 8 UTC)
-//  10. Session Ende UTC   - Ende der Handelszeit (-1=Auto: 20 UTC)
+//   9. Min Risk:Reward    - Mindest R:R Verhältnis (0=Auto, sonst 1.0-5.0)
+//  10. Take-Profit Faktor - TP-Multiplikator (0=Auto, 1.0=Standard, 2.0=doppelt)
 //
 // STRATEGIE-MODUS:
 //   Konservativ: Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5, max 1 Trade/Richtung
 //   Normal:      Standard-Werte (ausgewogen)
 //   Aggressiv:   Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5, max 3 Trades/Richtung
 //
-// v4.3 Benutzer-Parameter:
-//   - Von 2 auf 10 konfigurierbare Parameter erweitert
-//   - Strategie-Modus (Konservativ/Normal/Aggressiv) steuert Selektivität
-//   - Risiko, Drawdown, Tagesverlust individuell einstellbar
-//   - Max Positionen und Trades/Tag konfigurierbar
-//   - Session-Zeiten frei wählbar (nicht mehr fix 8-20 UTC)
-//   - 0 / -1 = Automatik (Timeframe-basierte Berechnung bleibt aktiv)
+// v4.4 Keine Zeitbegrenzungen + bessere Parameter:
+//   - Session-Start/Ende Parameter durch Min R:R und TP-Faktor ersetzt
+//   - ALLE Zeitbegrenzungen entfernt: Kein Session-Filter, kein Montag/Freitag-Block
+//   - Max-Haltezeit entfernt: Trades laufen so lange wie nötig
+//   - Session-Ende Auto-Close entfernt: Keine erzwungenen Schließungen
+//   - Session-Qualität ersetzt durch Markt-Qualität (Spread + Volatilität)
+//   - Min R:R als Parameter: User kann R:R direkt steuern (überschreibt Strategie-Modus)
+//   - TP-Faktor als Parameter: Multipliziert alle Take-Profits (1.5 = 50% größere TPs)
 //
 // v4.2 Neue Parameter & Features:
 //   ENTRY-QUALITÄT:
@@ -164,20 +165,19 @@ namespace cAlgo.Robots
         public int ParamMaxTagesTrades { get; set; }
         // 0 = Automatisch (6)
 
-        // --- ZEITFILTER ---
+        // --- TRADE-QUALITÄT ---
 
-        [Parameter("9. Session Start (UTC)", DefaultValue = -1, MinValue = -1, MaxValue = 23, Group = "Zeitfilter")]
-        public int ParamSessionStart { get; set; }
-        // -1 = Automatisch (8 UTC)
+        [Parameter("9. Min Risk:Reward", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
+        public double ParamMinRiskReward { get; set; }
+        // 0.0 = Automatisch (2.0, bzw. vom Strategie-Modus)
 
-        [Parameter("10. Session Ende (UTC)", DefaultValue = -1, MinValue = -1, MaxValue = 23, Group = "Zeitfilter")]
-        public int ParamSessionEnde { get; set; }
-        // -1 = Automatisch (20 UTC)
+        [Parameter("10. Take-Profit Faktor", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Trade-Qualität")]
+        public double ParamTpFaktor { get; set; }
+        // 0.0 = Automatisch | 1.0 = Standard | 1.5 = 50% größere TPs | 2.0 = doppelte TPs
 
-        // --- INTERNE SESSION-WERTE (aus Parametern oder Automatik) ---
-        private int _sessionStartStunde;
-        private int _sessionEndStunde;
+        // --- INTERNE WERTE ---
         private int _maxDailyTrades;
+        private double _tpFaktorUser; // User-TP-Multiplikator (1.0 = neutral)
 
         // =====================================================================
         // INDIKATOREN
@@ -294,8 +294,8 @@ namespace cAlgo.Robots
         private int _dailyTradeCount;
         // MaxDailyTrades: Über Parameter oder automatisch (default 6)
 
-        // Session-Qualität: Multiplikator basierend auf Handelszeit
-        private double _sessionQualitaet; // 0.0 - 1.0
+        // Markt-Qualität: Multiplikator basierend auf Spread + Vol
+        private double _marktQualitaet; // 0.0 - 1.0
 
         // Min Risk:Reward Ratio
         private double _minRiskReward;
@@ -314,11 +314,7 @@ namespace cAlgo.Robots
         // Volatilitäts-Regime Klassifizierung
         private VolatilitaetsRegime _aktuellesVolRegime;
 
-        // Max Haltezeit (in Minuten, berechnet aus Timeframe)
-        private int _maxHaltezeitBars;
-
-        // Session-Ende Auto-Close (Minuten vor Session-Ende)
-        private int _sessionEndeVorlaufMinuten;
+        // (v4.4: MaxHaltezeit und SessionEnde-Close entfernt - keine Zeitbegrenzungen)
 
         // Max Trades in gleicher Richtung
         private int _maxTradesGleicheRichtung;
@@ -343,7 +339,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.3 gestartet ===");
+            Print("=== FullAutoBot v4.4 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -387,7 +383,7 @@ namespace cAlgo.Robots
             _dailyResetDate = Server.Time.Date;
             _dailyProfitPercent = 0;
             _dailyTradeCount = 0;
-            _sessionQualitaet = 1.0;
+            _marktQualitaet = 1.0;
 
             // v4.2: Neue Variablen initialisieren
             _tickVolumeBars = _marktBars; // Volumen kommt von den Markt-Bars
@@ -401,9 +397,8 @@ namespace cAlgo.Robots
             _marktBars.BarOpened += OnBarOpened;
             Positions.Closed += OnPositionClosed;
 
-            Print("MaxHalte={0}Bars | SessionClose={1}Min | RegimeBest={2}Bars | MinMomentum={3:F2}",
-                _maxHaltezeitBars, _sessionEndeVorlaufMinuten,
-                _regimeBestaetigungsBars, _minMomentumSchwelle);
+            Print("RegimeBest={0}Bars | MinMomentum={1:F2} | MinRR={2:F1} | TP-Faktor={3:F1}",
+                _regimeBestaetigungsBars, _minMomentumSchwelle, _minRiskReward, _tpFaktorUser);
             Print("DD-Schutz: Stufe1 ab {0:F1}% (x{1:F2}) | Stufe2 ab {2:F1}% (x{3:F2})",
                 _ddStufe1Prozent, _ddStufe1Reduktion, _ddStufe2Prozent, _ddStufe2Reduktion);
         }
@@ -430,36 +425,30 @@ namespace cAlgo.Robots
 
             _maxDailyTrades = ParamMaxTagesTrades > 0 ? ParamMaxTagesTrades : 6;
 
-            // Zeitfilter: -1 = Automatik (8-20 UTC)
-            _sessionStartStunde = ParamSessionStart >= 0 ? ParamSessionStart : 8;
-            _sessionEndStunde = ParamSessionEnde >= 0 ? ParamSessionEnde : 20;
-
-            // Validierung: Start < Ende
-            if (_sessionStartStunde >= _sessionEndStunde)
-            {
-                Print("WARNUNG: Session-Start ({0}) >= Ende ({1}) - verwende Default 8-20",
-                    _sessionStartStunde, _sessionEndStunde);
-                _sessionStartStunde = 8;
-                _sessionEndStunde = 20;
-            }
-
             // DD-Stufen neu berechnen (falls MaxDD geändert wurde)
             _ddStufe1Prozent = _maxDrawdownPercent * 0.35;
             _ddStufe1Reduktion = 0.5;
             _ddStufe2Prozent = _maxDrawdownPercent * 0.65;
             _ddStufe2Reduktion = 0.25;
 
-            // Min R:R basiert auf Strategie-Modus
+            // Min R:R: User-Wert > 0 überschreibt Automatik
             _minRiskReward = 2.0;
+
+            // TP-Faktor: 0 = Auto (1.0), sonst User-Wert
+            _tpFaktorUser = ParamTpFaktor > 0 ? ParamTpFaktor : 1.0;
 
             // === STRATEGIE-MODUS anwenden ===
             WendeStrategieModusAn();
 
+            // User Min R:R NACH StrategieModus setzen (überschreibt Strategie-Default)
+            if (ParamMinRiskReward > 0)
+                _minRiskReward = ParamMinRiskReward;
+
             Print("Parameter: Risiko={0:F2}% | MaxDD={1:F1}% | Tagesverlust={2:F1}% | Pos={3} | Trades/Tag={4}",
                 _baseRiskPercent, _maxDrawdownPercent, _dailyLossLimitPercent,
                 _maxOpenPositions, _maxDailyTrades);
-            Print("Session: {0}:00-{1}:00 UTC | Strategie: {2}",
-                _sessionStartStunde, _sessionEndStunde,
+            Print("R:R min={0:F1} | TP-Faktor={1:F1}x | Strategie: {2}",
+                _minRiskReward, _tpFaktorUser,
                 StrategieModus == 1 ? "Konservativ" : (StrategieModus == 3 ? "Aggressiv" : "Normal"));
         }
 
@@ -531,8 +520,6 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 0.8; _maxDrawdownPercent = 6.0;
                 _maxOpenPositions = 2; _signalCooldown = 4; _staleTradeBarCount = 50;
                 _dailyLossLimitPercent = 2.0;
-                _maxHaltezeitBars = 120;         // 10h bei M5
-                _sessionEndeVorlaufMinuten = 30; // 30 Min vor Session-Ende raus
                 _maxTradesGleicheRichtung = 2;
                 _regimeBestaetigungsBars = 3;
                 _minMomentumSchwelle = 0.15;     // 15% MACD-Histogram über Vorgänger
@@ -547,8 +534,6 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 1.2; _maxDrawdownPercent = 8.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 40;
                 _dailyLossLimitPercent = 2.5;
-                _maxHaltezeitBars = 60;          // 30h bei M30
-                _sessionEndeVorlaufMinuten = 45;
                 _maxTradesGleicheRichtung = 2;
                 _regimeBestaetigungsBars = 3;
                 _minMomentumSchwelle = 0.10;
@@ -563,8 +548,6 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 1.6; _maxDrawdownPercent = 10.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 30;
                 _dailyLossLimitPercent = 3.0;
-                _maxHaltezeitBars = 40;          // Swing: mehr Geduld
-                _sessionEndeVorlaufMinuten = 0;  // Swing ignoriert Session-Ende
                 _maxTradesGleicheRichtung = 2;
                 _regimeBestaetigungsBars = 2;
                 _minMomentumSchwelle = 0.08;
@@ -579,8 +562,6 @@ namespace cAlgo.Robots
                 _baseRiskPercent = 2.2; _maxDrawdownPercent = 12.0;
                 _maxOpenPositions = 2; _signalCooldown = 3; _staleTradeBarCount = 25;
                 _dailyLossLimitPercent = 3.5;
-                _maxHaltezeitBars = 30;          // Positions: sehr geduldig
-                _sessionEndeVorlaufMinuten = 0;  // Positions ignoriert Session-Ende
                 _maxTradesGleicheRichtung = 2;
                 _regimeBestaetigungsBars = 2;
                 _minMomentumSchwelle = 0.05;
@@ -722,8 +703,8 @@ namespace cAlgo.Robots
             // v4.2: Marktstruktur aktualisieren
             AktualisiereMarktStruktur();
 
-            // Session-Qualität aktualisieren
-            _sessionQualitaet = BerechneSessionQualitaet();
+            // Markt-Qualität aktualisieren (basiert auf Spread + Volatilität)
+            _marktQualitaet = BerechneMarktQualitaet();
 
             // Sicherheitschecks
             if (!DarfHandeln())
@@ -757,11 +738,7 @@ namespace cAlgo.Robots
             // Stale Trades prüfen und schließen
             PruefeStaleTradesUndReversals();
 
-            // v4.2: Session-Ende Auto-Close (nur für Intraday/Scalping)
-            if (_sessionEndeVorlaufMinuten > 0)
-                PruefeSessionEndeAutoClose();
-
-            // v4.2: Regime-Cooldown mit konfigurierbaren Bestätigungs-Bars
+            // Regime-Cooldown mit konfigurierbaren Bestätigungs-Bars
             if (_barsSeitRegimeWechsel < _regimeBestaetigungsBars)
             {
                 Print("Regime-Cooldown: {0}/{1} Bars seit Wechsel - warte",
@@ -1704,18 +1681,18 @@ namespace cAlgo.Robots
                 sellScore -= 1;
             }
 
-            // --- SESSION-QUALITÄTS-BONUS (v3.3: granular statt flat +1) ---
-            if (_sessionQualitaet >= 0.9)
+            // --- MARKT-QUALITÄTS-BONUS (v4.4: basiert auf Spread + Vol statt Uhrzeit) ---
+            if (_marktQualitaet >= 0.9)
             {
-                buyScore += 2;  // Overlap/London-Kern: +2
+                buyScore += 2;  // Niedriger Spread, gute Vol: +2
                 sellScore += 2;
             }
-            else if (_sessionQualitaet >= 0.75)
+            else if (_marktQualitaet >= 0.75)
             {
-                buyScore += 1;  // London Open/NY: +1
+                buyScore += 1;  // Normaler Spread: +1
                 sellScore += 1;
             }
-            // Unter 0.75: Kein Bonus (schlechtere Sessions müssen über Signal-Qualität kompensieren)
+            // Unter 0.75: Kein Bonus (erhöhter Spread oder extreme Vol)
 
             // --- RICHTUNGS-BIAS: Lernt aus letzten Ergebnissen ---
             // Wenn Buys in letzter Zeit gut laufen -> Buy-Bonus
@@ -1887,9 +1864,12 @@ namespace cAlgo.Robots
                 takeProfitPips *= tpMultiplier;
             }
 
-            Print("SL:{0:F1} TP:{1:F1} | VolRatio:{2:F2} | SL-Adj:{3:F2} TP-Adj:{4:F2} | TPx:{5:F1}",
+            // v4.4: User-TP-Faktor anwenden (Parameter 10)
+            takeProfitPips *= _tpFaktorUser;
+
+            Print("SL:{0:F1} TP:{1:F1} | VolRatio:{2:F2} | SL-Adj:{3:F2} TP-Adj:{4:F2} | TPx:{5:F1} | UserTP:{6:F1}x",
                 stopLossPips, takeProfitPips, _volatilitaetsRatio,
-                volAnpassungSL, volAnpassungTP, tpMultiplier);
+                volAnpassungSL, volAnpassungTP, tpMultiplier, _tpFaktorUser);
 
             // Minimale Distanz
             double minPips = _marktSymbol.Spread * 3;
@@ -2027,11 +2007,11 @@ namespace cAlgo.Robots
             else if (_volatilitaetsRatio < 0.5)
                 risk *= 0.8; // Extreme Kontraktion: Wenig Bewegung erwartet
 
-            // 9. Session-Qualität: Außerhalb der Kernzeiten weniger riskieren
-            if (_sessionQualitaet < 0.75)
-                risk *= 0.7;  // Schlechte Session: 30% weniger Risiko
-            else if (_sessionQualitaet < 0.9)
-                risk *= 0.85; // Mittlere Session: 15% weniger
+            // 9. Markt-Qualität: Schlechter Spread / extreme Vol = weniger riskieren
+            if (_marktQualitaet < 0.75)
+                risk *= 0.7;  // Hoher Spread oder extreme Vol: 30% weniger
+            else if (_marktQualitaet < 0.9)
+                risk *= 0.85; // Leicht erhöhter Spread: 15% weniger
 
             // 10. Tages-P&L: Nach gutem Tag konservativer (Gewinne schützen)
             if (_dailyProfitPercent > _dailyLossLimitPercent * 1.5)
@@ -2244,16 +2224,7 @@ namespace cAlgo.Robots
                 // Wie viele Bars ist die Position schon offen?
                 int barsOffen = (int)((Server.Time - position.EntryTime).TotalMinutes / TimeframeZuMinuten(BotTimeframe));
 
-                // v4.2: MAXIMALE HALTEZEIT - harter Timeout
-                if (_maxHaltezeitBars > 0 && barsOffen >= _maxHaltezeitBars)
-                {
-                    Print("MAX-HALTEZEIT: {0} Bars ({1} max) bei {2:F1} Pips - schließe",
-                        barsOffen, _maxHaltezeitBars, position.Pips);
-                    ClosePosition(position);
-                    continue;
-                }
-
-                // STALE TRADE: Position geht nirgendwohin (v4.1: viel geduldiger)
+                // STALE TRADE: Position geht nirgendwohin
                 double atrPipsStale = AtrZuPips(_atr.Result.Last(1));
                 // Flach: kaum Bewegung nach vielen Bars - aber im Trend mehr Geduld
                 int staleGeduld = _aktuellesRegime == MarktRegime.StarkerTrend
@@ -2318,36 +2289,6 @@ namespace cAlgo.Robots
                     Print("REVERSAL-EXIT ({0} Signale) bei {1:F1} Pips (RSI:{2:F0})",
                         reversalZaehler, position.Pips, rsi);
                     ClosePosition(position);
-                }
-            }
-        }
-
-        // =====================================================================
-        // v4.2: SESSION-ENDE AUTO-CLOSE
-        // =====================================================================
-
-        private void PruefeSessionEndeAutoClose()
-        {
-            int stunde = Server.Time.Hour;
-            int minute = Server.Time.Minute;
-            int sessionEndStunde = _sessionEndStunde;
-
-            // Berechne Minuten bis Session-Ende
-            int minutenBisEnde = (sessionEndStunde - stunde) * 60 - minute;
-
-            if (minutenBisEnde > 0 && minutenBisEnde <= _sessionEndeVorlaufMinuten)
-            {
-                var positionen = Positions.FindAll(BotLabel, _marktSymbol.Name);
-                foreach (var pos in positionen)
-                {
-                    // Nur Positionen schließen die wenig im Gewinn sind (große Runner laufen lassen)
-                    double atrPips = AtrZuPips(_atr.Result.Last(1));
-                    if (pos.Pips < atrPips * 2.0) // Weniger als 2 ATR Gewinn
-                    {
-                        Print("SESSION-ENDE: Schließe {0} bei {1:F1} Pips ({2} Min bis Session-Ende)",
-                            pos.TradeType, pos.Pips, minutenBisEnde);
-                        ClosePosition(pos);
-                    }
                 }
             }
         }
@@ -2428,56 +2369,39 @@ namespace cAlgo.Robots
                 return false;
             }
 
-            if (!IstAktiveHandelszeit())
-                return false;
-
+            // Wochenende: Markt geschlossen
             if (Server.Time.DayOfWeek == DayOfWeek.Saturday || Server.Time.DayOfWeek == DayOfWeek.Sunday)
-                return false;
-
-            // Freitag ab 18 Uhr: Keine neuen Trades (Gap-Risiko + abnehmende Liquidität)
-            if (Server.Time.DayOfWeek == DayOfWeek.Friday && Server.Time.Hour >= 18)
-                return false;
-
-            // Montag-Morgen: Erste 2 Stunden = choppy nach Weekend → kein Neueinstieg
-            if (Server.Time.DayOfWeek == DayOfWeek.Monday && Server.Time.Hour < 10)
                 return false;
 
             return true;
         }
 
-        private bool IstAktiveHandelszeit()
+        // v4.4: Markt-Qualität basiert auf Spread und Volatilität statt auf Uhrzeit
+        private double BerechneMarktQualitaet()
         {
-            int stunde = Server.Time.Hour;
-            // Session-Zeiten aus Benutzer-Parametern (Default: 8-20 UTC)
-            return stunde >= _sessionStartStunde && stunde <= _sessionEndStunde;
-        }
+            double qualitaet = 1.0;
 
-        private double BerechneSessionQualitaet()
-        {
-            int stunde = Server.Time.Hour;
+            // Spread-Qualität: Je niedriger der Spread vs Durchschnitt, desto besser
+            if (_spreadSampleCount >= 10 && _avgSpread > 0)
+            {
+                double spreadRatio = _marktSymbol.Spread / _avgSpread;
+                if (spreadRatio < 0.8)
+                    qualitaet = 1.0;       // Niedriger Spread: Top-Qualität
+                else if (spreadRatio < 1.2)
+                    qualitaet = 0.9;       // Normaler Spread
+                else if (spreadRatio < 2.0)
+                    qualitaet = 0.75;      // Erhöhter Spread
+                else
+                    qualitaet = 0.5;       // Hoher Spread: Schlechtere Qualität
+            }
 
-            // London/NY Overlap (13-16 UTC): Beste Liquidität = bestes Trading
-            if (stunde >= 13 && stunde <= 16)
-                return 1.0;
+            // Vol-Regime anpassen: Extreme Volatilität = niedrigere Qualität
+            if (_aktuellesVolRegime == VolatilitaetsRegime.Extrem)
+                qualitaet *= 0.6;
+            else if (_aktuellesVolRegime == VolatilitaetsRegime.Niedrig)
+                qualitaet *= 0.8; // Kaum Bewegung erwartet
 
-            // London Kern (9-12 UTC): Gute Liquidität
-            if (stunde >= 9 && stunde <= 12)
-                return 0.9;
-
-            // NY Kern (14-17 UTC) - teilweise Overlap
-            if (stunde >= 14 && stunde <= 17)
-                return 0.85;
-
-            // Session-Rand: Erste und letzte Stunde der User-Session
-            if (stunde == _sessionStartStunde || stunde == _sessionEndStunde)
-                return 0.65;
-
-            // Außerhalb Kern aber innerhalb Session
-            if (stunde >= _sessionStartStunde && stunde <= _sessionEndStunde)
-                return 0.75;
-
-            // Alles andere
-            return 0.5;
+            return qualitaet;
         }
 
         // =====================================================================
@@ -2487,7 +2411,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.3 gestoppt ===");
+            Print("=== FullAutoBot v4.4 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
@@ -2504,8 +2428,8 @@ namespace cAlgo.Robots
             Print("Buy WR: {0}/{1} | Sell WR: {2}/{3}",
                 _recentBuyWins, _recentBuyWins + _recentBuyLosses,
                 _recentSellWins, _recentSellWins + _recentSellLosses);
-            Print("Heute: PnL {0:+0.00;-0.00}% | Trades: {1} | Session-Q: {2:F2}",
-                _dailyProfitPercent, _dailyTradeCount, _sessionQualitaet);
+            Print("Heute: PnL {0:+0.00;-0.00}% | Trades: {1} | Markt-Q: {2:F2}",
+                _dailyProfitPercent, _dailyTradeCount, _marktQualitaet);
             Print("Vol-Regime: {0} | Struktur: SH={1:F5} SL={2:F5} | DD-Stufen: {3:F1}%/{4:F1}%",
                 _aktuellesVolRegime, _letzterSwingHigh, _letzterSwingLow,
                 _ddStufe1Prozent, _ddStufe2Prozent);
