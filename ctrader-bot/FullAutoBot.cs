@@ -1,17 +1,21 @@
 // ============================================================================
-// FullAutoBot v2 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v3 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
 // Nur 2 Parameter: Timeframe + Markt (Symbol)
 // Alles andere wird automatisch berechnet und angepasst.
 //
-// v2 Verbesserungen:
-//   - Ereignisreaktion: Position-Close-Events, Spread-Spike-Erkennung,
-//     Gap-Detection, Reversal-Exit, Stale-Trade-Timeout
-//   - Positionsgrößen: Kelly-Criterion, Win-Rate-Tracking,
-//     Pyramiding bei starken Trends, Anti-Martingale
-//   - Profitabilität: Partial-Close bei 1R/2R, Break-Even-Stop,
-//     dynamische TP-Extension, Markt-Regime-Erkennung,
-//     aktiver Reversal-Exit, Spread-Filter
+// v3 Verbesserungen:
+//   - Flexibler HTF-Filter statt binärem Block (Seitwärts +1, Gegen +Sperre)
+//   - Bollinger-Squeeze-Breakout auch in Konsolidierung erlaubt
+//   - Adaptive RSI-Schwellen je nach Trendrichtung
+//   - Session-Qualitäts-Bonus (London/NY Overlap)
+//   - Stärkere ADX-Gewichtung bei hoher Trendstärke
+//   - Konfluenz-Boost: Volle Zeitebenen-Übereinstimmung = +2
+//   - Break-Even bei 1.5R (nicht 1.0R - verhindert Ausstoppung)
+//   - Progressiver Trailing: enger je höher der Gewinn
+//   - Partial Close 25% bei 2.5R, 75% trailing lassen
+//   - Anti-Martingale: 1 Verlust = normal, erst ab 2 bremsen
+//   - ADX-gewichtetes Risiko für Trend-Überzeugung
 // ============================================================================
 
 using System;
@@ -111,7 +115,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v2 gestartet ===");
+            Print("=== FullAutoBot v3 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -637,13 +641,19 @@ namespace cAlgo.Robots
             // EMA Trend (Gewicht: 2)
             if (analyse.EmaSignal == TrendRichtung.Aufwaerts) buyScore += 2;
 
-            // ADX + DI Richtung (Gewicht: 2)
-            if (analyse.IstTrendStark && analyse.DiPlus > analyse.DiMinus) buyScore += 2;
+            // ADX + DI Richtung (Gewicht: 2-3, extra für starke Trends)
+            if (analyse.IstTrendStark && analyse.DiPlus > analyse.DiMinus)
+            {
+                buyScore += 2;
+                if (analyse.Trendstaerke > 30) buyScore += 1; // Bonus für sehr starken Trend
+            }
 
-            // RSI Zone (Gewicht: 2)
-            if (analyse.RsiUeberverkauft) buyScore += 2;
-            else if (analyse.RsiWert < 45 && analyse.RsiWert > 30) buyScore += 1;
-            if (analyse.RsiUeberkauft) buyScore -= 3;
+            // RSI Zone - ADAPTIV an Trend (im Aufwärtstrend: Pullbacks = Kaufchance)
+            double buyOversold = analyse.EmaSignal == TrendRichtung.Aufwaerts ? 40 : 30;
+            double buyOverbought = analyse.EmaSignal == TrendRichtung.Aufwaerts ? 80 : 70;
+            if (analyse.RsiWert < buyOversold) buyScore += 2;
+            else if (analyse.RsiWert < 50 && analyse.RsiWert > buyOversold) buyScore += 1;
+            if (analyse.RsiWert > buyOverbought) buyScore -= 3;
 
             // RSI Divergenz (Gewicht: 3 - stark!)
             if (analyse.RsiBullishDivergenz) buyScore += 3;
@@ -678,8 +688,8 @@ namespace cAlgo.Robots
             // ATR expandiert = Markt bestätigt Bewegung (Gewicht: 1)
             if (analyse.AtrExpandiert) buyScore += 1;
 
-            // Volle Konfluenz = alle Zeitebenen einig (Gewicht: 1)
-            if (analyse.VolleKonfluenzBuy) buyScore += 1;
+            // Volle Konfluenz = alle Zeitebenen einig (Gewicht: 2 - stark!)
+            if (analyse.VolleKonfluenzBuy) buyScore += 2;
 
             // --- GEWICHTETES SELL SCORING ---
 
@@ -691,11 +701,18 @@ namespace cAlgo.Robots
 
             if (analyse.EmaSignal == TrendRichtung.Abwaerts) sellScore += 2;
 
-            if (analyse.IstTrendStark && analyse.DiMinus > analyse.DiPlus) sellScore += 2;
+            if (analyse.IstTrendStark && analyse.DiMinus > analyse.DiPlus)
+            {
+                sellScore += 2;
+                if (analyse.Trendstaerke > 30) sellScore += 1;
+            }
 
-            if (analyse.RsiUeberkauft) sellScore += 2;
-            else if (analyse.RsiWert > 55 && analyse.RsiWert < 70) sellScore += 1;
-            if (analyse.RsiUeberverkauft) sellScore -= 3;
+            // RSI adaptiv für Sell (im Abwärtstrend: Bounces = Verkaufschance)
+            double sellOverbought = analyse.EmaSignal == TrendRichtung.Abwaerts ? 60 : 70;
+            double sellOversold = analyse.EmaSignal == TrendRichtung.Abwaerts ? 20 : 30;
+            if (analyse.RsiWert > sellOverbought) sellScore += 2;
+            else if (analyse.RsiWert > 50 && analyse.RsiWert < sellOverbought) sellScore += 1;
+            if (analyse.RsiWert < sellOversold) sellScore -= 3;
 
             if (analyse.RsiBearishDivergenz) sellScore += 3;
 
@@ -713,54 +730,75 @@ namespace cAlgo.Robots
             if (analyse.Regime == MarktRegime.StarkerTrend && analyse.EmaSignal == TrendRichtung.Abwaerts)
                 sellScore += 1;
 
-            // 3-Bar Momentum Konsistenz
             if (analyse.DreiBarsAbwaerts) sellScore += 1;
-
-            // Close im unteren Drittel der Bar = bärische Überzeugung
             if (analyse.CloseImUnterenDrittel) sellScore += 1;
-
-            // EMA-Pullback-Bounce = qualitativ hochwertiger Einstieg
             if (analyse.EmaPullbackBounceSell) sellScore += 2;
-
-            // ATR expandiert = Markt bestätigt Bewegung
             if (analyse.AtrExpandiert) sellScore += 1;
+            if (analyse.VolleKonfluenzSell) sellScore += 2;
 
-            // Volle Konfluenz = alle Zeitebenen einig
-            if (analyse.VolleKonfluenzSell) sellScore += 1;
+            // --- SESSION-QUALITÄTS-BONUS ---
+            // London/NY Overlap = beste Liquidität = zuverlässigste Signale
+            int stunde = Server.Time.Hour;
+            if (stunde >= 13 && stunde <= 16) // London + NY Overlap (UTC)
+            {
+                buyScore += 1;
+                sellScore += 1;
+            }
 
             // --- ENTSCHEIDUNG ---
-            // SNIPER-MODUS: Nur hochqualitative Setups, dafür mit voller Ladung
-            // Konsolidierung = kein Trade (zu viele Fehlsignale)
-            if (analyse.Regime == MarktRegime.Konsolidierung)
-                return;
+            // v3: Flexibler HTF-Filter + Squeeze-Breakout in Konsolidierung
 
-            // Regime-adaptive Schwellenwerte: Höhere Qualität = bessere Trades
+            // Regime-adaptive Schwellenwerte
             int minScore;
             switch (analyse.Regime)
             {
                 case MarktRegime.StarkerTrend: minScore = 6; break;
-                case MarktRegime.MittlererTrend: minScore = 7; break;
-                default: minScore = 8; break; // SchwacherTrend
+                case MarktRegime.MittlererTrend: minScore = 6; break;
+                case MarktRegime.Konsolidierung:
+                    // Konsolidierung: NUR Bollinger-Squeeze-Breakouts erlaubt
+                    if (!analyse.BollingerSqueeze)
+                        return;
+                    minScore = 8; // Muss absolut überzeugend sein
+                    break;
+                default: minScore = 7; break; // SchwacherTrend
             }
 
-            // HTF-Pflicht: Nur in Richtung des übergeordneten Trends traden
-            bool htfErlaubtBuy = analyse.HtfTrend == TrendRichtung.Aufwaerts;
-            bool htfErlaubtSell = analyse.HtfTrend == TrendRichtung.Abwaerts;
+            // HTF-Filter: Flexibel statt binärer Block
+            // Mit HTF: +0 | Seitwärts: +1 | Gegen HTF: gesperrt
+            int htfBuyAufschlag = 0;
+            int htfSellAufschlag = 0;
 
-            // Score-Differenz muss eindeutig sein (kein "vielleicht")
-            if (buyScore >= minScore && buyScore > sellScore + 3 && htfErlaubtBuy)
+            if (analyse.HtfTrend == TrendRichtung.Seitwaerts)
+            {
+                htfBuyAufschlag = 1;
+                htfSellAufschlag = 1;
+            }
+            else if (analyse.HtfTrend == TrendRichtung.Aufwaerts)
+            {
+                htfSellAufschlag = 99; // Sell gegen HTF = gesperrt
+            }
+            else // Abwaerts
+            {
+                htfBuyAufschlag = 99; // Buy gegen HTF = gesperrt
+            }
+
+            int buyMinScore = minScore + htfBuyAufschlag;
+            int sellMinScore = minScore + htfSellAufschlag;
+
+            // Score-Differenz: Richtung muss klar sein
+            if (buyScore >= buyMinScore && buyScore > sellScore + 2)
             {
                 analyse.Signal = SignalTyp.Buy;
                 analyse.SignalScore = buyScore;
-                Print("BUY Score:{0} (Sell:{1}) | HTF:{2} | RSI:{3:F0} | ADX:{4:F0} | Regime:{5}",
-                    buyScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
+                Print("BUY Score:{0}/{1} (Sell:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0} | Regime:{6}",
+                    buyScore, buyMinScore, sellScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
-            else if (sellScore >= minScore && sellScore > buyScore + 3 && htfErlaubtSell)
+            else if (sellScore >= sellMinScore && sellScore > buyScore + 2)
             {
                 analyse.Signal = SignalTyp.Sell;
                 analyse.SignalScore = sellScore;
-                Print("SELL Score:{0} (Buy:{1}) | HTF:{2} | RSI:{3:F0} | ADX:{4:F0} | Regime:{5}",
-                    sellScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
+                Print("SELL Score:{0}/{1} (Buy:{2}) | HTF:{3} | RSI:{4:F0} | ADX:{5:F0} | Regime:{6}",
+                    sellScore, sellMinScore, buyScore, analyse.HtfTrend, analyse.RsiWert, analyse.Trendstaerke, analyse.Regime);
             }
         }
 
@@ -785,16 +823,22 @@ namespace cAlgo.Robots
             double stopLossPips = AtrZuPips(atr * _atrMultiplierSL);
             double takeProfitPips = AtrZuPips(atr * _atrMultiplierTP);
 
-            // Dynamische TP-Extension: Gewinne maximieren in Trends
-            if (analyse.Regime == MarktRegime.StarkerTrend && analyse.SignalScore >= 7)
+            // Dynamische TP-Extension: Regime- und Score-basiert
+            double tpMultiplier = 1.0;
+            if (analyse.Regime == MarktRegime.StarkerTrend)
+                tpMultiplier = 1.8;
+            else if (analyse.Regime == MarktRegime.MittlererTrend)
+                tpMultiplier = 1.3;
+
+            // A+ Setups bekommen mindestens 1.4x TP unabhängig vom Regime
+            if (analyse.SignalScore >= 10)
+                tpMultiplier = Math.Max(tpMultiplier, 1.4);
+
+            if (tpMultiplier > 1.0)
             {
-                takeProfitPips *= 1.8;
-                Print("STARKER Trend -> TP auf {0:F1} Pips extended (1.8x)", takeProfitPips);
-            }
-            else if (analyse.Regime == MarktRegime.MittlererTrend && analyse.SignalScore >= 6)
-            {
-                takeProfitPips *= 1.3;
-                Print("Mittlerer Trend -> TP auf {0:F1} Pips extended (1.3x)", takeProfitPips);
+                takeProfitPips *= tpMultiplier;
+                Print("TP extended {0:F1}x -> {1:F1} Pips | Regime:{2} Score:{3}",
+                    tpMultiplier, takeProfitPips, analyse.Regime, analyse.SignalScore);
             }
 
             // Minimale Distanz
@@ -848,36 +892,43 @@ namespace cAlgo.Robots
                 risk = Math.Min(risk * 1.5, kellyRisk);
             }
 
-            // Anti-Martingale: Moderat nach Gewinnen hoch, schnell runter nach Verlusten
-            if (_consecutiveWins >= 3)
-                risk *= 1.3;  // +30% nach 3 Gewinnen
+            // Anti-Martingale: 1 Verlust = normal (gehört dazu), erst ab 2 bremsen
+            if (_consecutiveWins >= 4)
+                risk *= 1.4;  // +40% nach 4+ Gewinnen
+            else if (_consecutiveWins >= 3)
+                risk *= 1.25; // +25% nach 3 Gewinnen
             else if (_consecutiveWins >= 2)
                 risk *= 1.15; // +15% nach 2 Gewinnen
 
-            if (_consecutiveLosses >= 3)
-                risk *= 0.3;  // -70% nach 3 Verlusten - SOFORT bremsen
+            if (_consecutiveLosses >= 4)
+                risk *= 0.25; // -75% nach 4+ Verlusten
+            else if (_consecutiveLosses >= 3)
+                risk *= 0.4;  // -60% nach 3 Verlusten
             else if (_consecutiveLosses >= 2)
-                risk *= 0.5;  // -50% nach 2 Verlusten
-            else if (_consecutiveLosses >= 1)
-                risk *= 0.75; // -25% nach 1 Verlust
+                risk *= 0.6;  // -40% nach 2 Verlusten
+            // 1 Verlust: KEIN Abzug - normale Handelsrealität
 
-            // Drawdown-Skalierung: Risiko ab 40% des Max-Drawdown reduzieren (früher bremsen)
+            // Drawdown-Skalierung: ab 50% des Max-DD bremsen
             _currentDrawdown = _peakBalance > 0 ? ((_peakBalance - Account.Balance) / _peakBalance) * 100 : 0;
-            if (_currentDrawdown > _maxDrawdownPercent * 0.4)
+            if (_currentDrawdown > _maxDrawdownPercent * 0.5)
             {
-                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.4) / (_maxDrawdownPercent * 0.6));
-                risk *= Math.Max(0.15, ddFaktor);
+                double ddFaktor = 1.0 - ((_currentDrawdown - _maxDrawdownPercent * 0.5) / (_maxDrawdownPercent * 0.5));
+                risk *= Math.Max(0.2, ddFaktor);
             }
 
-            // Signal-Score-Bonus: NUR A+ Setups bekommen mehr Risiko
-            // Durch die hohen Schwellen (6-8) kommen nur gute Signale durch
+            // Signal-Score-Bonus: A+ Setups bekommen mehr Risiko
             if (analyse.SignalScore >= 12) risk *= 2.0;  // Jackpot-Setup: volle Ladung
             else if (analyse.SignalScore >= 10) risk *= 1.6;
             else if (analyse.SignalScore >= 8) risk *= 1.3;
-            // Kein Abzug nötig - schlechte Scores kommen gar nicht durch den Filter
+
+            // ADX-Trendstärke-Gewichtung: Starker Trend = mehr Überzeugung
+            if (analyse.Trendstaerke > 35)
+                risk *= 1.15;
+            else if (analyse.Trendstaerke < 20)
+                risk *= 0.85;
 
             // Regime-Anpassung
-            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.3;
+            if (analyse.Regime == MarktRegime.StarkerTrend) risk *= 1.2;
 
             // Harte Grenzen: bis zu 2.5x Basis erlaubt
             return Math.Max(0.15, Math.Min(risk, _baseRiskPercent * 2.5));
@@ -925,33 +976,44 @@ namespace cAlgo.Robots
                 double atrPips = AtrZuPips(atr);
                 double slPips = AtrZuPips(atr * _atrMultiplierSL);
 
-                // 1. BREAK-EVEN: SL auf Einstandspreis setzen bei 1.0R Gewinn (Kapital schützen)
-                if (position.Pips > slPips * 1.0 && !IstBreakEven(position))
+                // 1. BREAK-EVEN: bei 1.5R (nicht früher - Markt braucht Raum zum Atmen)
+                if (position.Pips > slPips * 1.5 && !IstBreakEven(position))
                 {
                     SetzeBreakEven(position);
                 }
 
-                // 2. PARTIAL CLOSE bei 3R Gewinn: nur 33% schließen, 67% laufen lassen
-                if (position.Pips > slPips * 3.0 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 2)
+                // 2. PARTIAL CLOSE: 25% bei 2.5R sichern, Rest laufen lassen
+                if (position.Pips > slPips * 2.5 && position.VolumeInUnits > _marktSymbol.VolumeInUnitsMin * 3)
                 {
                     double closeVolume = _marktSymbol.NormalizeVolumeInUnits(
-                        position.VolumeInUnits * 0.33, RoundingMode.Down);
+                        position.VolumeInUnits * 0.25, RoundingMode.Down);
                     if (closeVolume >= _marktSymbol.VolumeInUnitsMin)
                     {
                         ClosePosition(position, closeVolume);
-                        Print("PARTIAL CLOSE 33% bei +{0:F1} Pips (3R erreicht)", position.Pips);
+                        Print("PARTIAL CLOSE 25% bei +{0:F1} Pips (2.5R erreicht)", position.Pips);
                     }
                 }
 
-                // 3. TRAILING STOP (nur bei Gewinn > 2.5R)
-                double trailingStart = slPips * 2.5;
+                // 3. PROGRESSIVER TRAILING STOP: Enger je höher der Gewinn
+                double trailingStart = slPips * 2.0;
                 if (position.Pips > trailingStart)
                 {
-                    double trailingDistanz = AtrZuPips(atr * _trailingAtrMultiplier);
+                    double profitR = position.Pips / slPips;
 
-                    // Im starken Trend: weiterer Trailing Stop
+                    // Trailing-Distanz verkürzt sich mit steigendem Gewinn
+                    double trailingFaktor;
+                    if (profitR > 5.0)
+                        trailingFaktor = 0.6;  // 5R+: eng, Gewinn sichern
+                    else if (profitR > 3.5)
+                        trailingFaktor = 0.8;  // 3.5-5R: mittel
+                    else
+                        trailingFaktor = 1.0;  // 2-3.5R: normal
+
+                    double trailingDistanz = AtrZuPips(atr * _trailingAtrMultiplier * trailingFaktor);
+
+                    // Im starken Trend: etwas mehr Raum lassen
                     if (_aktuellesRegime == MarktRegime.StarkerTrend)
-                        trailingDistanz *= 1.5;
+                        trailingDistanz *= 1.3;
 
                     double neuerSL;
                     if (position.TradeType == TradeType.Buy)
@@ -1139,7 +1201,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v2 gestoppt ===");
+            Print("=== FullAutoBot v3 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
