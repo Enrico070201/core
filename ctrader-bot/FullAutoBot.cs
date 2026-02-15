@@ -1,8 +1,32 @@
 // ============================================================================
-// FullAutoBot v4.2 - Vollautomatischer cTrader Trading Bot
+// FullAutoBot v4.3 - Vollautomatischer cTrader Trading Bot
 // ============================================================================
-// Nur 2 Parameter: Timeframe + Markt (Symbol)
-// Alles andere wird automatisch berechnet und angepasst.
+// 10 Parameter für volle Kontrolle - Rest wird automatisch berechnet.
+//
+// PARAMETER:
+//   1. Timeframe          - Chart-Zeitrahmen (M1 bis Monthly)
+//   2. Markt (Symbol)     - Handelsinstrument (EURUSD, GBPJPY, etc.)
+//   3. Strategie-Modus    - 1=Konservativ, 2=Normal, 3=Aggressiv
+//   4. Basis-Risiko %     - Risiko pro Trade (0=Auto)
+//   5. Max Drawdown %     - Maximaler Drawdown bis Stop (0=Auto)
+//   6. Max Tagesverlust % - Tägliches Verlustlimit (0=Auto)
+//   7. Max Positionen     - Gleichzeitig offene Trades (0=Auto)
+//   8. Max Trades/Tag     - Übertrading-Schutz (0=Auto)
+//   9. Session Start UTC  - Beginn der Handelszeit (-1=Auto: 8 UTC)
+//  10. Session Ende UTC   - Ende der Handelszeit (-1=Auto: 20 UTC)
+//
+// STRATEGIE-MODUS:
+//   Konservativ: Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5, max 1 Trade/Richtung
+//   Normal:      Standard-Werte (ausgewogen)
+//   Aggressiv:   Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5, max 3 Trades/Richtung
+//
+// v4.3 Benutzer-Parameter:
+//   - Von 2 auf 10 konfigurierbare Parameter erweitert
+//   - Strategie-Modus (Konservativ/Normal/Aggressiv) steuert Selektivität
+//   - Risiko, Drawdown, Tagesverlust individuell einstellbar
+//   - Max Positionen und Trades/Tag konfigurierbar
+//   - Session-Zeiten frei wählbar (nicht mehr fix 8-20 UTC)
+//   - 0 / -1 = Automatik (Timeframe-basierte Berechnung bleibt aktiv)
 //
 // v4.2 Neue Parameter & Features:
 //   ENTRY-QUALITÄT:
@@ -99,14 +123,61 @@ namespace cAlgo.Robots
     public class FullAutoBot : Robot
     {
         // =====================================================================
-        // NUR DIESE 2 PARAMETER - ALLES ANDERE IST AUTOMATISCH
+        // BENUTZER-PARAMETER (10 Stück - Rest wird automatisch berechnet)
         // =====================================================================
 
-        [Parameter("Timeframe", DefaultValue = "Hour")]
+        // --- GRUNDEINSTELLUNGEN ---
+
+        [Parameter("1. Timeframe", DefaultValue = "Hour", Group = "Grundeinstellungen")]
         public TimeFrame BotTimeframe { get; set; }
 
-        [Parameter("Markt (Symbol)", DefaultValue = "EURUSD")]
+        [Parameter("2. Markt (Symbol)", DefaultValue = "EURUSD", Group = "Grundeinstellungen")]
         public string MarktSymbol { get; set; }
+
+        [Parameter("3. Strategie-Modus", DefaultValue = 2, MinValue = 1, MaxValue = 3, Group = "Grundeinstellungen")]
+        public int StrategieModus { get; set; }
+        // 1 = Konservativ (wenige Trades, hohe Qualität)
+        // 2 = Normal (ausgewogen)
+        // 3 = Aggressiv (mehr Trades, niedrigere Schwellen)
+
+        // --- RISIKO ---
+
+        [Parameter("4. Basis-Risiko %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "Risiko")]
+        public double ParamBasisRisiko { get; set; }
+        // 0.0 = Automatisch (vom Timeframe berechnet)
+
+        [Parameter("5. Max Drawdown %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 25.0, Step = 0.5, Group = "Risiko")]
+        public double ParamMaxDrawdown { get; set; }
+        // 0.0 = Automatisch
+
+        [Parameter("6. Max Tagesverlust %", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 10.0, Step = 0.5, Group = "Risiko")]
+        public double ParamMaxTagesverlust { get; set; }
+        // 0.0 = Automatisch
+
+        // --- TRADE-MANAGEMENT ---
+
+        [Parameter("7. Max offene Positionen", DefaultValue = 0, MinValue = 0, MaxValue = 5, Group = "Trade-Management")]
+        public int ParamMaxPositionen { get; set; }
+        // 0 = Automatisch (2)
+
+        [Parameter("8. Max Trades pro Tag", DefaultValue = 0, MinValue = 0, MaxValue = 20, Group = "Trade-Management")]
+        public int ParamMaxTagesTrades { get; set; }
+        // 0 = Automatisch (6)
+
+        // --- ZEITFILTER ---
+
+        [Parameter("9. Session Start (UTC)", DefaultValue = -1, MinValue = -1, MaxValue = 23, Group = "Zeitfilter")]
+        public int ParamSessionStart { get; set; }
+        // -1 = Automatisch (8 UTC)
+
+        [Parameter("10. Session Ende (UTC)", DefaultValue = -1, MinValue = -1, MaxValue = 23, Group = "Zeitfilter")]
+        public int ParamSessionEnde { get; set; }
+        // -1 = Automatisch (20 UTC)
+
+        // --- INTERNE SESSION-WERTE (aus Parametern oder Automatik) ---
+        private int _sessionStartStunde;
+        private int _sessionEndStunde;
+        private int _maxDailyTrades;
 
         // =====================================================================
         // INDIKATOREN
@@ -221,7 +292,7 @@ namespace cAlgo.Robots
         private double _dailyLossLimitPercent;
         private double _dailyProfitPercent;
         private int _dailyTradeCount;
-        private const int MaxDailyTrades = 6; // Übertrading-Schutz
+        // MaxDailyTrades: Über Parameter oder automatisch (default 6)
 
         // Session-Qualität: Multiplikator basierend auf Handelszeit
         private double _sessionQualitaet; // 0.0 - 1.0
@@ -272,7 +343,7 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            Print("=== FullAutoBot v4.2 gestartet ===");
+            Print("=== FullAutoBot v4.3 gestartet ===");
             Print("Markt: {0} | Timeframe: {1}", MarktSymbol, BotTimeframe);
 
             _marktSymbol = Symbols.GetSymbol(MarktSymbol);
@@ -286,6 +357,7 @@ namespace cAlgo.Robots
             _marktBars = MarketData.GetBars(BotTimeframe, _marktSymbol.Name);
 
             AdaptiereParameterAnTimeframe();
+            UebernehmeBenuzerParameter();
             InitialisiereIndikatoren();
             InitialisiereHigherTimeframe();
 
@@ -316,7 +388,6 @@ namespace cAlgo.Robots
             _dailyProfitPercent = 0;
             _dailyTradeCount = 0;
             _sessionQualitaet = 1.0;
-            _minRiskReward = 2.0; // Mindestens 2:1 R:R sonst kein Trade (vorher 1.8)
 
             // v4.2: Neue Variablen initialisieren
             _tickVolumeBars = _marktBars; // Volumen kommt von den Markt-Bars
@@ -330,13 +401,116 @@ namespace cAlgo.Robots
             _marktBars.BarOpened += OnBarOpened;
             Positions.Closed += OnPositionClosed;
 
-            Print("Bot initialisiert | Basis-Risiko: {0:F2}% | Max Drawdown: {1:F1}%",
-                _baseRiskPercent, _maxDrawdownPercent);
-            Print("v4.2 Parameter: MaxHalte={0}Bars | SessionClose={1}Min | RichtungsLimit={2} | RegimeBest={3}Bars | MinMomentum={4:F2}",
-                _maxHaltezeitBars, _sessionEndeVorlaufMinuten, _maxTradesGleicheRichtung,
+            Print("MaxHalte={0}Bars | SessionClose={1}Min | RegimeBest={2}Bars | MinMomentum={3:F2}",
+                _maxHaltezeitBars, _sessionEndeVorlaufMinuten,
                 _regimeBestaetigungsBars, _minMomentumSchwelle);
             Print("DD-Schutz: Stufe1 ab {0:F1}% (x{1:F2}) | Stufe2 ab {2:F1}% (x{3:F2})",
                 _ddStufe1Prozent, _ddStufe1Reduktion, _ddStufe2Prozent, _ddStufe2Reduktion);
+        }
+
+        // =====================================================================
+        // BENUTZER-PARAMETER ÜBERNEHMEN (nach Timeframe-Adaption)
+        // =====================================================================
+
+        private void UebernehmeBenuzerParameter()
+        {
+            // Risiko: User-Wert > 0 überschreibt Automatik
+            if (ParamBasisRisiko > 0)
+                _baseRiskPercent = ParamBasisRisiko;
+
+            if (ParamMaxDrawdown > 0)
+                _maxDrawdownPercent = ParamMaxDrawdown;
+
+            if (ParamMaxTagesverlust > 0)
+                _dailyLossLimitPercent = ParamMaxTagesverlust;
+
+            // Trade-Management: 0 = Automatik
+            if (ParamMaxPositionen > 0)
+                _maxOpenPositions = ParamMaxPositionen;
+
+            _maxDailyTrades = ParamMaxTagesTrades > 0 ? ParamMaxTagesTrades : 6;
+
+            // Zeitfilter: -1 = Automatik (8-20 UTC)
+            _sessionStartStunde = ParamSessionStart >= 0 ? ParamSessionStart : 8;
+            _sessionEndStunde = ParamSessionEnde >= 0 ? ParamSessionEnde : 20;
+
+            // Validierung: Start < Ende
+            if (_sessionStartStunde >= _sessionEndStunde)
+            {
+                Print("WARNUNG: Session-Start ({0}) >= Ende ({1}) - verwende Default 8-20",
+                    _sessionStartStunde, _sessionEndStunde);
+                _sessionStartStunde = 8;
+                _sessionEndStunde = 20;
+            }
+
+            // DD-Stufen neu berechnen (falls MaxDD geändert wurde)
+            _ddStufe1Prozent = _maxDrawdownPercent * 0.35;
+            _ddStufe1Reduktion = 0.5;
+            _ddStufe2Prozent = _maxDrawdownPercent * 0.65;
+            _ddStufe2Reduktion = 0.25;
+
+            // Min R:R basiert auf Strategie-Modus
+            _minRiskReward = 2.0;
+
+            // === STRATEGIE-MODUS anwenden ===
+            WendeStrategieModusAn();
+
+            Print("Parameter: Risiko={0:F2}% | MaxDD={1:F1}% | Tagesverlust={2:F1}% | Pos={3} | Trades/Tag={4}",
+                _baseRiskPercent, _maxDrawdownPercent, _dailyLossLimitPercent,
+                _maxOpenPositions, _maxDailyTrades);
+            Print("Session: {0}:00-{1}:00 UTC | Strategie: {2}",
+                _sessionStartStunde, _sessionEndStunde,
+                StrategieModus == 1 ? "Konservativ" : (StrategieModus == 3 ? "Aggressiv" : "Normal"));
+        }
+
+        // =====================================================================
+        // STRATEGIE-MODUS: Konservativ / Normal / Aggressiv
+        // =====================================================================
+
+        // Interner Strategie-Score-Offset (wird auf minScore addiert/subtrahiert)
+        private int _strategieScoreOffset;
+        // Interner Cooldown-Multiplikator
+        private double _strategieCooldownMultiplier;
+        // Interner Risiko-Multiplikator
+        private double _strategieRisikoMultiplier;
+
+        private void WendeStrategieModusAn()
+        {
+            switch (StrategieModus)
+            {
+                case 1: // KONSERVATIV: Wenige Trades, hohe Qualität, geringes Risiko
+                    _strategieScoreOffset = 2;        // +2 auf alle minScores
+                    _strategieCooldownMultiplier = 1.5; // 50% längerer Cooldown
+                    _strategieRisikoMultiplier = 0.7;   // 30% weniger Risiko
+                    _minRiskReward = 2.5;               // Min 2.5:1 R:R
+                    _maxTradesGleicheRichtung = 1;      // Nur 1 Trade pro Richtung
+                    Print("MODUS: Konservativ - Score+2, Cooldown x1.5, Risiko x0.7, R:R min 2.5:1");
+                    break;
+
+                case 3: // AGGRESSIV: Mehr Trades, niedrigere Schwellen, höheres Risiko
+                    _strategieScoreOffset = -1;       // -1 auf minScores
+                    _strategieCooldownMultiplier = 0.7; // 30% kürzerer Cooldown
+                    _strategieRisikoMultiplier = 1.3;   // 30% mehr Risiko
+                    _minRiskReward = 1.5;               // Min 1.5:1 R:R
+                    _maxTradesGleicheRichtung = 3;      // Bis zu 3 in gleicher Richtung
+                    Print("MODUS: Aggressiv - Score-1, Cooldown x0.7, Risiko x1.3, R:R min 1.5:1");
+                    break;
+
+                default: // NORMAL: Ausgewogen (Standard)
+                    _strategieScoreOffset = 0;
+                    _strategieCooldownMultiplier = 1.0;
+                    _strategieRisikoMultiplier = 1.0;
+                    _minRiskReward = 2.0;
+                    // _maxTradesGleicheRichtung bleibt wie vom Timeframe gesetzt
+                    Print("MODUS: Normal - Standardwerte");
+                    break;
+            }
+
+            // Risiko-Multiplikator anwenden
+            _baseRiskPercent *= _strategieRisikoMultiplier;
+
+            // Cooldown anpassen
+            _signalCooldown = Math.Max(2, (int)(_signalCooldown * _strategieCooldownMultiplier));
         }
 
         // =====================================================================
@@ -1586,6 +1760,9 @@ namespace cAlgo.Robots
                 default: minScore = 11; break; // SchwacherTrend (vorher 8)
             }
 
+            // Strategie-Modus Offset: Konservativ +2, Normal +0, Aggressiv -1
+            minScore = Math.Max(5, minScore + _strategieScoreOffset);
+
             // ADX darf nicht fallend sein (Trend schwächt sich ab = schlechter Einstieg)
             if (analyse.AdxFallend && analyse.Regime != MarktRegime.Konsolidierung)
             {
@@ -2153,7 +2330,7 @@ namespace cAlgo.Robots
         {
             int stunde = Server.Time.Hour;
             int minute = Server.Time.Minute;
-            int sessionEndStunde = 20; // Session-Ende: 20 UTC
+            int sessionEndStunde = _sessionEndStunde;
 
             // Berechne Minuten bis Session-Ende
             int minutenBisEnde = (sessionEndStunde - stunde) * 60 - minute;
@@ -2245,9 +2422,9 @@ namespace cAlgo.Robots
             }
 
             // Übertrading-Schutz: Max Trades pro Tag
-            if (_dailyTradeCount >= MaxDailyTrades)
+            if (_dailyTradeCount >= _maxDailyTrades)
             {
-                Print("MAX DAILY TRADES: {0} Trades heute - genug für heute", _dailyTradeCount);
+                Print("MAX DAILY TRADES: {0}/{1} Trades heute - genug für heute", _dailyTradeCount, _maxDailyTrades);
                 return false;
             }
 
@@ -2271,8 +2448,8 @@ namespace cAlgo.Robots
         private bool IstAktiveHandelszeit()
         {
             int stunde = Server.Time.Hour;
-            // Nur Hauptsessions: London + NY (beste Liquidität)
-            return stunde >= 8 && stunde <= 20;
+            // Session-Zeiten aus Benutzer-Parametern (Default: 8-20 UTC)
+            return stunde >= _sessionStartStunde && stunde <= _sessionEndStunde;
         }
 
         private double BerechneSessionQualitaet()
@@ -2291,15 +2468,15 @@ namespace cAlgo.Robots
             if (stunde >= 14 && stunde <= 17)
                 return 0.85;
 
-            // London Open (8 UTC): Volatiler, aber Breakout-Chancen
-            if (stunde == 8)
+            // Session-Rand: Erste und letzte Stunde der User-Session
+            if (stunde == _sessionStartStunde || stunde == _sessionEndStunde)
+                return 0.65;
+
+            // Außerhalb Kern aber innerhalb Session
+            if (stunde >= _sessionStartStunde && stunde <= _sessionEndStunde)
                 return 0.75;
 
-            // NY Nachmittag (18-20 UTC): Abnehmende Liquidität
-            if (stunde >= 18 && stunde <= 20)
-                return 0.6;
-
-            // Alles andere (sollte durch IstAktiveHandelszeit gefiltert werden)
+            // Alles andere
             return 0.5;
         }
 
@@ -2310,7 +2487,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             int total = _totalWins + _totalLosses;
-            Print("=== FullAutoBot v4.2 gestoppt ===");
+            Print("=== FullAutoBot v4.3 gestoppt ===");
             Print("Trades: {0} | Wins: {1} | Losses: {2} | WR: {3:F1}%",
                 total, _totalWins, _totalLosses, WinRate() * 100);
             if (_totalWins > 0 && _totalLosses > 0)
